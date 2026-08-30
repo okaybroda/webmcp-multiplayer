@@ -1,0 +1,31 @@
+{
+  "name": "webmcp-game",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+  "scripts": {
+		"build": "vite build && wrangler deploy --dry-run",
+		"deploy": "npm run build && wrangler deploy",
+		"dev": "vite build && wrangler dev",
+		"dev:client": "vite build --watch",
+		"start": "vite build && wrangler dev",
+		"cf-typegen": "wrangler types",
+		"typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "typescript": "^5.5.2",
+    "vite": "^8.2.2",
+    "wrangler": "^4.127.1"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.11.0",
+    "@codemirror/lang-markdown": "^6.5.2",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.9",
+    "partyserver": "^0.5.10",
+    "y-codemirror.next": "^0.3.6",
+    "y-partyserver": "^2.2.0",
+    "yjs": "^13.6.32"
+  }
+}
