@@ -38,7 +38,10 @@
 		"skipLibCheck": true,
 		"types": [
 			"./worker-configuration.d.ts",
-			"node"
+			"node",
+			"react",
+			"react-dom"
 		]
-	}
+	},
+	"exclude": ["excalidraw"]
 }

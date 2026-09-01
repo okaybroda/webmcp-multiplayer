@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Canvas Relay · WebMCP demo</title>
+    <meta name="description" content="A live visual workspace for people and agents." />
+    <script type="module" src="/src/canvas.ts"></script>
+  </head>
+  <body>
+    <main class="canvas-app">
+      <header class="canvas-header">
+        <div><p class="canvas-eyebrow">WEBMCP × YJS × EXCALIDRAW</p><h1>Canvas Relay</h1><p>One shared visual workspace for a person and their agents.</p></div>
+        <div class="canvas-status"><span id="canvas-dot"></span><span id="canvas-connection">Connecting…</span><strong id="canvas-revision">Revision —</strong></div>
+      </header>
+      <section class="canvas-notice"><span>Public daily demo. Agents must read before changing the canvas; the server blocks stale writes and returns changes made since their last read.</span><div id="canvas-commit-overlay"></div></section>
+      <section class="canvas-layout">
+        <div class="excalidraw-shell"><div id="excalidraw-root" class="excalidraw-root" aria-label="Collaborative design canvas"></div></div>
+        <aside class="canvas-panel">
+          <section><h2>Collaborate visibly</h2><p>Sketch directly on the board. Changes sync through Yjs in real time, so people and agents work on the same scene instead of passing screenshots back and forth.</p></section>
+          <section><h2>Human draft</h2><p>Canvas edits remain local until you commit them. A conflicting live update disables the commit until you discard and review.</p><div id="canvas-draft-controls"></div></section>
+          <section><h2>Revision-safe tools</h2><p>Each agent has a browser-held read receipt. <code>read_canvas</code> records it; create, update, and delete are rejected if anything changed since then.</p></section>
+          <section><h2>WebMCP</h2><p id="canvas-webmcp">Looking for a compatible agent host…</p><button id="canvas-copy-prompt" type="button">Copy Codex collaboration prompt</button></section>
+          <section class="canvas-history">
+            <div class="canvas-tablist" role="tablist" aria-label="Canvas history">
+              <button id="canvas-activity-tab" class="canvas-tab" type="button" role="tab" aria-selected="true" aria-controls="canvas-activity-pane">Activity</button>
+              <button id="canvas-revisions-tab" class="canvas-tab" type="button" role="tab" aria-selected="false" aria-controls="canvas-revisions-pane">Revisions</button>
+            </div>
+            <div id="canvas-activity-pane" role="tabpanel" aria-labelledby="canvas-activity-tab"><ol id="canvas-activity" aria-live="polite"></ol></div>
+            <div id="canvas-revisions-pane" role="tabpanel" aria-labelledby="canvas-revisions-tab" hidden><ol id="canvas-revisions" aria-live="polite"></ol></div>
+          </section>
+        </aside>
+      </section>
+    </main>
+  </body>
+</html>

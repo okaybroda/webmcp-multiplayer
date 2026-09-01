@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Shared contract · WebMCP demo</title>
+    <meta name="description" content="A live collaborative document with agent freshness checks." />
+    <script type="module" src="/src/client.ts"></script>
+  </head>
+  <body>
+    <main>
+      <header class="masthead">
+        <div><p class="eyebrow">WEBMCP × YJS</p><h1>Shared contract</h1><p class="subhead">Live human edits, guarded agent edits.</p></div>
+        <div class="connection" aria-live="polite"><span id="connection-dot" class="dot"></span><span id="connection-status">Connecting…</span></div>
+      </header>
+      <section class="notice">This is a public daily demo document. Do not enter confidential contract details.</section>
+      <section class="workspace">
+        <div class="editor-panel"><div class="panel-header"><span>CONTRACT.md</span><span id="revision">Revision —</span></div><div id="editor" aria-label="Collaborative contract editor"></div></div>
+        <aside class="side-panel">
+          <section class="history-panel"><div class="history-heading"><h2>Version history</h2><span id="history-notice" class="history-notice" role="status">Loading…</span></div><p>Recent changes to the shared document.</p><div id="history-diffs" class="history-diffs" aria-live="polite"></div><button id="history-load-more" class="secondary" type="button" hidden>Load 10 more</button></section>
+          <section><h2>Human changes</h2><p>Add, edit, or remove text in the editor. Draft changes appear inline: red is removed text, green is proposed text. Click its ✓ to publish.</p><p id="draft-status" class="draft-status" role="status">No draft changes.</p><div class="actions"><button id="discard-draft" class="secondary" type="button" disabled>Discard draft</button></div></section>
+          <section><h2>Agent protocol</h2><p>The client retains each agent’s opaque session ID. The server tracks what that session last read; agents never send a revision number.</p><div class="actions"><button id="open-in-codex" type="button">Copy prompt to use Codex to modify the doc</button><button id="run-demo" type="button">Run Agent A + B demo</button><button id="reset-demo" class="secondary" type="button">Reload document</button></div><p class="handoff-hint">Copies a ready-to-paste brief for this live document.</p></section>
+          <section><h2>Activity</h2><ol id="activity" class="activity" aria-live="polite"></ol></section>
+          <section><h2>WebMCP</h2><p id="webmcp-status">Looking for a compatible agent host…</p></section>
+        </aside>
+      </section>
+    </main>
+    <dialog id="restore-dialog" class="restore-dialog" aria-labelledby="restore-title">
+      <header class="dialog-header"><div><p class="eyebrow">HUMAN CONFIRMATION</p><h2 id="restore-title">Restore as a new revision</h2></div><button id="restore-cancel" class="secondary" type="button">Cancel</button></header>
+      <p>Red lines are current text that would be removed. Green lines are historical text that would be restored. No history is deleted.</p>
+      <div id="restore-diff" class="restore-diff" aria-label="Restore changes"></div>
+      <div id="restore-turnstile" data-action="turnstile-spin-v1"></div>
+      <p id="restore-status" class="dialog-notice" role="status">Loading confirmation…</p>
+      <div class="dialog-actions"><button id="restore-confirm" type="button" disabled>Restore as new revision</button></div>
+    </dialog>
+  </body>
+</html>

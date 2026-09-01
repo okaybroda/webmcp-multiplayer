@@ -7,12 +7,24 @@
 	"name": "webmcp-game",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-08-25",
+	"routes": [
+		{
+			"pattern": "webmcp-demo.rakanlabs.com",
+			"custom_domain": true
+		}
+	],
 	"migrations": [
 		{
 			"new_sqlite_classes": [
 				"DocumentRoom"
 			],
 			"tag": "v1"
+		},
+		{
+			"new_sqlite_classes": [
+				"CanvasRoom"
+			],
+			"tag": "v2"
 		}
 	],
 	"assets": {
@@ -24,8 +36,21 @@
 			{
 				"class_name": "DocumentRoom",
 				"name": "DOCUMENT_ROOM"
+			},
+			{
+				"class_name": "CanvasRoom",
+				"name": "CANVAS_ROOM"
 			}
 		]
+	},
+	"services": [
+		{
+			"binding": "TURNSTILE_VERIFY",
+			"service": "turnstile-siteverify-webmcp-game"
+		}
+	],
+	"vars": {
+		"TURNSTILE_SITE_KEY": "0x4AAAAAAEiVBZSmlCJT9AMI"
 	},
 	"observability": {
 		"enabled": true

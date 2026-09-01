@@ -3,26 +3,32 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Shared contract · WebMCP demo</title>
-    <meta name="description" content="A live collaborative document with agent freshness checks." />
-    <script type="module" src="/src/client.ts"></script>
+    <title>WebMCP Multiplayer Demos</title>
+    <meta name="description" content="Choose a collaborative document or visual workspace for people and agents." />
+    <link rel="stylesheet" href="/src/landing.css" />
   </head>
   <body>
-    <main>
-      <header class="masthead">
-        <div><p class="eyebrow">WEBCMP × YJS</p><h1>Shared contract</h1><p class="subhead">Live human edits, guarded agent edits.</p></div>
-        <div class="connection" aria-live="polite"><span id="connection-dot" class="dot"></span><span id="connection-status">Connecting…</span></div>
-      </header>
-      <section class="notice">This is a public daily demo document. Do not enter confidential contract details.</section>
-      <section class="workspace">
-        <div class="editor-panel"><div class="panel-header"><span>CONTRACT.md</span><span id="revision">Revision —</span></div><div id="editor" aria-label="Collaborative contract editor"></div></div>
-        <aside class="side-panel">
-          <section><h2>Human changes</h2><p>Add, edit, or remove text in the editor. Draft changes appear inline: red is removed text, green is proposed text. Click its ✓ to publish.</p><p id="draft-status" class="draft-status" role="status">No draft changes.</p><div class="actions"><button id="discard-draft" class="secondary" type="button" disabled>Discard draft</button></div></section>
-          <section><h2>Agent protocol</h2><p>The client retains each agent’s opaque session ID. The server tracks what that session last read; agents never send a revision number.</p><div class="actions"><button id="open-in-codex" type="button">Copy prompt to use Codex to modify the doc</button><button id="run-demo" type="button">Run Agent A + B demo</button><button id="reset-demo" class="secondary" type="button">Reload document</button></div><p class="handoff-hint">Copies a ready-to-paste brief for this live document.</p></section>
-          <section><h2>Activity</h2><ol id="activity" class="activity" aria-live="polite"></ol></section>
-          <section><h2>WebMCP</h2><p id="webmcp-status">Looking for a compatible agent host…</p></section>
-        </aside>
-      </section>
+    <main class="launcher">
+      <p class="eyebrow">WEBMCP × REAL-TIME COLLABORATION</p>
+      <h1>What should your team work on?</h1>
+      <p class="intro">Choose a shared workspace. Each demo shows people and agents collaborating live, with browser-held revision receipts that prevent stale agent edits.</p>
+      <div class="choices">
+        <a class="choice document-choice" href="/document/">
+          <span class="choice-icon" aria-hidden="true">✦</span>
+          <span class="choice-kind">Collaborative document</span>
+          <strong>Draft a shared contract</strong>
+          <span>Review line-level changes, let people approve drafts, and keep a revision history.</span>
+          <span class="choice-action">Open document →</span>
+        </a>
+        <a class="choice canvas-choice" href="/canvas/">
+          <span class="choice-icon" aria-hidden="true">✎</span>
+          <span class="choice-kind">Visual workspace</span>
+          <strong>Draw on a shared canvas</strong>
+          <span>Sketch diagrams together with Excalidraw, commit human drafts, and inspect live revisions.</span>
+          <span class="choice-action">Open canvas →</span>
+        </a>
+      </div>
+      <p class="footnote">Public daily demos — do not enter confidential information.</p>
     </main>
   </body>
 </html>
