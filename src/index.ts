@@ -1,4 +1,4 @@
-import { getServerByName, routePartykitRequest, type Connection } from "partyserver";
+import { getServerByName, routePartykitRequest, type Connection, type WSMessage } from "partyserver";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
 
@@ -9,11 +9,24 @@ const HISTORY_PAGE_SIZE = 10;
 const MAX_HISTORY_QUERY_LENGTH = 200;
 const MAX_CANVAS_ELEMENTS = 400;
 const MAX_CANVAS_ELEMENT_BYTES = 60_000;
+const MAX_CANVAS_PATCH_BYTES = 16_000;
+const MAX_CANVAS_SCENE_BYTES = 256_000;
+const MAX_JSON_BODY_BYTES = 256_000;
+const MAX_WEBSOCKET_MESSAGE_BYTES = 128_000;
+const RATE_WINDOW_MS = 60_000;
+const MAX_HTTP_REQUESTS_PER_WINDOW = 90;
+const MAX_WEBSOCKET_CONNECTIONS_PER_WINDOW = 24;
+const MAX_WEBSOCKET_MESSAGES_PER_WINDOW = 120;
+const ACTIVITY_RETENTION_MS = 6 * 60 * 60 * 1_000;
+const MAX_RETAINED_REVISIONS = 100;
 const TURNSTILE_ACTION = "turnstile-spin-v1";
 const ALLOWED_TURNSTILE_HOSTNAMES = new Set([
-	"webmcp-game.viventhraarao.workers.dev",
+	"webmcp-demo.rakanlabs.com",
 	"localhost",
 	"127.0.0.1",
+]);
+const CANVAS_PATCH_FIELDS = new Set([
+	"x", "y", "width", "height", "angle", "text", "originalText", "strokeColor", "backgroundColor", "fillStyle", "strokeWidth", "strokeStyle", "roughness", "opacity", "fontSize", "fontFamily", "textAlign", "verticalAlign", "lineHeight", "link", "locked",
 ]);
 const INITIAL_DOCUMENT = `# Services Agreement
 
@@ -50,6 +63,8 @@ type CanvasMutation =
 	| { action: "create"; elements: CanvasElement[] }
 	| { action: "update"; patches: Array<{ id: string; patch: Record<string, unknown> }> }
 	| { action: "delete"; ids: string[] };
+type RateLimitRow = { windowStart: number; count: number };
+type SocketState = { actorId: string; windowStart: number; messageCount: number };
 
 function todayRoomName(now = new Date()): string { return `contract-demo-${now.toISOString().slice(0, 10)}`; }
 function todayCanvasRoomName(now = new Date()): string { return `canvas-demo-${now.toISOString().slice(0, 10)}`; }
@@ -60,6 +75,28 @@ function asRevision(value: unknown): number | null {
 }
 function asOptionalQuery(value: string | null): string { return (value ?? "").trim().slice(0, MAX_HISTORY_QUERY_LENGTH); }
 function snapshotJson(document: Y.Doc): string { return JSON.stringify(Array.from(Y.encodeStateAsUpdate(document))); }
+function clientIp(request: Request): string { return request.headers.get("CF-Connecting-IP")?.slice(0, 64) || "local"; }
+function sameOrigin(request: Request): boolean {
+	const origin = request.headers.get("Origin");
+	if (origin === "https://webmcp-demo.rakanlabs.com") return true;
+	// Wrangler rewrites requests through the custom-domain host while running
+	// locally, so retain that exact HTTP origin for development only.
+	if (origin === "http://webmcp-demo.rakanlabs.com") return true;
+	if (origin === null) return false;
+	try {
+		const localOrigin = new URL(origin);
+		return localOrigin.protocol === "http:" && (localOrigin.hostname === "localhost" || localOrigin.hostname === "127.0.0.1");
+	} catch { return false; }
+}
+function messageSize(message: WSMessage): number { return typeof message === "string" ? new TextEncoder().encode(message).byteLength : message.byteLength; }
+function allowWebSocketMessage(connection: Connection): boolean {
+	const now = Date.now();
+	const state = connection.state as SocketState | null;
+	if (!state || state.windowStart <= now - RATE_WINDOW_MS) { connection.setState({ actorId: state?.actorId ?? "viewer", windowStart: now, messageCount: 1 }); return true; }
+	if (state.messageCount >= MAX_WEBSOCKET_MESSAGES_PER_WINDOW) return false;
+	connection.setState({ ...state, messageCount: state.messageCount + 1 });
+	return true;
+}
 
 function asReplacement(value: unknown): Replacement | null {
 	if (!value || typeof value !== "object") return null;
@@ -127,8 +164,19 @@ function canvasElement(value: unknown): CanvasElement | null {
 	if (!isRecord(value) || !safeId(value.id) || typeof value.type !== "string" || value.type.length === 0 || value.type.length > 40) return null;
 	try {
 		const copy = JSON.parse(JSON.stringify(value)) as CanvasElement;
-		return JSON.stringify(copy).length <= MAX_CANVAS_ELEMENT_BYTES ? copy : null;
+		const serialized = JSON.stringify(copy);
+		return serialized.length <= MAX_CANVAS_ELEMENT_BYTES ? copy : null;
 	} catch { return null; }
+}
+function canvasPatch(value: unknown): Record<string, unknown> | null {
+	if (!isRecord(value) || Object.keys(value).some((key) => !CANVAS_PATCH_FIELDS.has(key))) return null;
+	try { return JSON.stringify(value).length <= MAX_CANVAS_PATCH_BYTES ? JSON.parse(JSON.stringify(value)) as Record<string, unknown> : null; } catch { return null; }
+}
+function canvasScene(value: unknown): CanvasElement[] | null {
+	if (!Array.isArray(value) || value.length > MAX_CANVAS_ELEMENTS) return null;
+	const elements = value.map(canvasElement);
+	if (!elements.every((element): element is CanvasElement => element !== null) || new Set(elements.map((element) => element.id)).size !== elements.length) return null;
+	try { return JSON.stringify(elements).length <= MAX_CANVAS_SCENE_BYTES ? elements : null; } catch { return null; }
 }
 function canvasMutation(value: unknown): CanvasMutation | null {
 	if (!isRecord(value) || typeof value.action !== "string") return null;
@@ -137,7 +185,11 @@ function canvasMutation(value: unknown): CanvasMutation | null {
 		return elements.every((element): element is CanvasElement => element !== null) && elements.length > 0 && elements.length <= 40 ? { action: "create", elements } : null;
 	}
 	if (value.action === "update" && Array.isArray(value.patches)) {
-		const patches = value.patches.map((item) => isRecord(item) && safeId(item.id) && isRecord(item.patch) ? { id: item.id, patch: item.patch } : null);
+		const patches = value.patches.map((item) => {
+			if (!isRecord(item) || !safeId(item.id)) return null;
+			const patch = canvasPatch(item.patch);
+			return patch ? { id: item.id, patch } : null;
+		});
 		return patches.every((patch): patch is { id: string; patch: Record<string, unknown> } => patch !== null) && patches.length > 0 && patches.length <= 40 ? { action: "update", patches } : null;
 	}
 	if (value.action === "delete" && Array.isArray(value.ids)) {
@@ -155,9 +207,12 @@ export class DocumentRoom extends YServer {
 
 	private revision = 0;
 	private lastText = "";
+	private started = false;
 
 	async onStart(): Promise<void> {
+		if (this.started) return;
 		await super.onStart();
+		this.started = true;
 		// A tab left open across UTC midnight must not revive an archived room.
 		// This also clears connections from pre-hibernation deployments once they
 		// next wake the object.
@@ -174,6 +229,7 @@ export class DocumentRoom extends YServer {
 			CREATE TABLE IF NOT EXISTS operations (operation_id TEXT PRIMARY KEY, result_json TEXT NOT NULL, created_at INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS revision_snapshots (revision INTEGER PRIMARY KEY, actor TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL, kind TEXT NOT NULL, source_revision INTEGER);
 			CREATE TABLE IF NOT EXISTS restore_intents (intent_id TEXT PRIMARY KEY, target_revision INTEGER NOT NULL, expected_revision INTEGER NOT NULL, requested_by TEXT NOT NULL, status TEXT NOT NULL, result_json TEXT, created_at INTEGER NOT NULL);
+			CREATE TABLE IF NOT EXISTS request_limits (key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL);
 			CREATE INDEX IF NOT EXISTS restore_intents_status_idx ON restore_intents(status);
 		`);
 		const row = Array.from(this.ctx.storage.sql.exec<{ revision: number; snapshotJson: string }>("SELECT revision, snapshot_json as snapshotJson FROM room_state WHERE id = 1"))[0];
@@ -190,11 +246,20 @@ export class DocumentRoom extends YServer {
 	}
 	async onSave(): Promise<void> { this.persistSnapshot(); }
 	onConnect(connection: Connection, context: { request: Request }): void {
-		const actorId = new URL(context.request.url).searchParams.get("actor")?.slice(0, 80) || "human";
-		connection.setState({ actorId });
+		connection.setState({ actorId: "viewer", windowStart: Date.now(), messageCount: 0 });
 		super.onConnect(connection, context);
 	}
-	isReadOnly(): boolean { return this.name !== todayRoomName(); }
+	isReadOnly(): boolean { return true; }
+	onMessage(connection: Connection, message: WSMessage): void {
+		if (messageSize(message) > MAX_WEBSOCKET_MESSAGE_BYTES) { connection.close(1009, "WebSocket message too large"); return; }
+		if (!allowWebSocketMessage(connection)) { connection.close(1008, "WebSocket message rate exceeded"); return; }
+		super.onMessage(connection, message);
+	}
+	async allowClientAction(ip: string, kind: "http" | "websocket"): Promise<boolean> {
+		if (!this.started) await this.onStart();
+		const limit = kind === "http" ? MAX_HTTP_REQUESTS_PER_WINDOW : MAX_WEBSOCKET_CONNECTIONS_PER_WINDOW;
+		return this.consumeRateLimit(ip, kind, limit);
+	}
 
 	async readForSession(sessionId: string): Promise<OperationResult> {
 		if (!safeId(sessionId)) return { status: "invalid_session" };
@@ -237,6 +302,16 @@ export class DocumentRoom extends YServer {
 		}
 		this.recordRead(sessionId);
 		return this.storeOperation(operationId, { status: "applied", revision: this.revision });
+	}
+	async commitHumanDraft(baseText: string, nextText: string): Promise<OperationResult> {
+		if (this.name !== todayRoomName()) return { status: "room_expired", rereadRequired: true };
+		if (baseText.length > MAX_DOCUMENT_LENGTH || nextText.length > MAX_DOCUMENT_LENGTH) return { status: "invalid_document" };
+		const current = this.document.getText("content").toString();
+		if (current !== baseText) return { status: "stale", revision: this.revision, content: current };
+		if (current === nextText) return { status: "no_change", revision: this.revision };
+		const text = this.document.getText("content");
+		this.document.transact(() => { text.delete(0, current.length); text.insert(0, nextText); }, { actorId: "human", kind: "edit" });
+		return { status: "applied", revision: this.revision };
 	}
 	async status(): Promise<OperationResult> { return { room: this.name, revision: this.revision, content: this.document.getText("content").toString(), active: this.name === todayRoomName() }; }
 
@@ -321,10 +396,29 @@ export class DocumentRoom extends YServer {
 		});
 		this.revision = record.revision;
 		this.lastText = next;
+		this.pruneActivity(record.createdAt);
 	}
-	private recordRead(sessionId: string): void { this.ctx.storage.sql.exec("INSERT INTO read_receipts (session_id, revision, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, updated_at = excluded.updated_at", sessionId, this.revision, Date.now()); }
-	private storeOperation(operationId: string, result: OperationResult): OperationResult { this.ctx.storage.sql.exec("INSERT INTO operations (operation_id, result_json, created_at) VALUES (?, ?, ?)", operationId, JSON.stringify(result), Date.now()); return result; }
+	private recordRead(sessionId: string): void { const now = Date.now(); this.ctx.storage.sql.exec("INSERT INTO read_receipts (session_id, revision, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, updated_at = excluded.updated_at", sessionId, this.revision, now); this.pruneActivity(now); }
+	private storeOperation(operationId: string, result: OperationResult): OperationResult { const now = Date.now(); this.ctx.storage.sql.exec("INSERT INTO operations (operation_id, result_json, created_at) VALUES (?, ?, ?)", operationId, JSON.stringify(result), now); this.pruneActivity(now); return result; }
 	private persistSnapshot(): void { this.ctx.storage.sql.exec("INSERT INTO room_state (id, revision, snapshot_json) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, snapshot_json = excluded.snapshot_json", this.revision, snapshotJson(this.document)); }
+	private consumeRateLimit(ip: string, kind: string, limit: number): boolean {
+		const key = `${kind}:${ip.slice(0, 64)}`;
+		const now = Date.now();
+		const row = Array.from(this.ctx.storage.sql.exec<RateLimitRow>("SELECT window_start as windowStart, count FROM request_limits WHERE key = ?", key))[0];
+		if (!row || row.windowStart <= now - RATE_WINDOW_MS) { this.ctx.storage.sql.exec("INSERT INTO request_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE SET window_start = excluded.window_start, count = excluded.count", key, now); return true; }
+		if (row.count >= limit) return false;
+		this.ctx.storage.sql.exec("UPDATE request_limits SET count = count + 1 WHERE key = ?", key);
+		return true;
+	}
+	private pruneActivity(now: number): void {
+		const oldest = Math.max(0, this.revision - MAX_RETAINED_REVISIONS);
+		this.ctx.storage.sql.exec("DELETE FROM read_receipts WHERE updated_at < ?", now - ACTIVITY_RETENTION_MS);
+		this.ctx.storage.sql.exec("DELETE FROM operations WHERE created_at < ?", now - ACTIVITY_RETENTION_MS);
+		this.ctx.storage.sql.exec("DELETE FROM restore_intents WHERE created_at < ?", now - ACTIVITY_RETENTION_MS);
+		this.ctx.storage.sql.exec("DELETE FROM changes WHERE revision < ?", oldest);
+		this.ctx.storage.sql.exec("DELETE FROM revision_snapshots WHERE revision < ?", oldest);
+		this.ctx.storage.sql.exec("DELETE FROM request_limits WHERE window_start < ?", now - RATE_WINDOW_MS * 2);
+	}
 }
 
 /** A separate, public daily visual collaboration room for the Excalidraw demo. */
@@ -351,6 +445,7 @@ export class CanvasRoom extends YServer {
 			CREATE TABLE IF NOT EXISTS canvas_changes (revision INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, element_ids_json TEXT NOT NULL, created_at INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS canvas_read_receipts (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 			CREATE TABLE IF NOT EXISTS canvas_operations (operation_id TEXT PRIMARY KEY, result_json TEXT NOT NULL, created_at INTEGER NOT NULL);
+			CREATE TABLE IF NOT EXISTS request_limits (key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL);
 		`);
 		this.revision = Array.from(this.ctx.storage.sql.exec<{ revision: number }>("SELECT revision FROM canvas_state WHERE id = 1"))[0]?.revision ?? 0;
 		const snapshot = Array.from(this.ctx.storage.sql.exec<{ snapshotJson: string }>("SELECT snapshot_json as snapshotJson FROM canvas_snapshots WHERE id = 1"))[0];
@@ -361,11 +456,20 @@ export class CanvasRoom extends YServer {
 		this.loaded = true;
 	}
 	onConnect(connection: Connection, context: { request: Request }): void {
-		const actorId = new URL(context.request.url).searchParams.get("actor")?.slice(0, 80) || "human";
-		connection.setState({ actorId });
+		connection.setState({ actorId: "viewer", windowStart: Date.now(), messageCount: 0 });
 		super.onConnect(connection, context);
 	}
-	isReadOnly(): boolean { return this.name !== todayCanvasRoomName(); }
+	isReadOnly(): boolean { return true; }
+	onMessage(connection: Connection, message: WSMessage): void {
+		if (messageSize(message) > MAX_WEBSOCKET_MESSAGE_BYTES) { connection.close(1009, "WebSocket message too large"); return; }
+		if (!allowWebSocketMessage(connection)) { connection.close(1008, "WebSocket message rate exceeded"); return; }
+		super.onMessage(connection, message);
+	}
+	async allowClientAction(ip: string, kind: "http" | "websocket"): Promise<boolean> {
+		await this.ensureLoaded();
+		const limit = kind === "http" ? MAX_HTTP_REQUESTS_PER_WINDOW : MAX_WEBSOCKET_CONNECTIONS_PER_WINDOW;
+		return this.consumeRateLimit(ip, kind, limit);
+	}
 
 	async readForSession(sessionId: string): Promise<OperationResult> {
 		await this.ensureLoaded();
@@ -402,6 +506,25 @@ export class CanvasRoom extends YServer {
 		const changedIds = this.applyMutation(operation, actorLabel);
 		this.recordRead(sessionId);
 		return this.storeOperation(operationId, { status: changedIds.length ? "applied" : "no_change", revision: this.revision, changedElementIds: changedIds });
+	}
+	async commitHumanScene(expectedRevision: number, scene: CanvasElement[]): Promise<OperationResult> {
+		await this.ensureLoaded();
+		if (this.name !== todayCanvasRoomName()) return { status: "room_expired", rereadRequired: true };
+		if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== this.revision) return { status: "stale", currentRevision: this.revision, elements: this.sceneElements() };
+		const elements = canvasScene(scene);
+		if (!elements) return { status: "invalid_scene" };
+		const next = new Map(elements.map((element) => [element.id, element]));
+		const changed = new Set<string>();
+		this.document.transact(() => {
+			for (const id of [...this.elements.keys()]) if (!next.has(id)) { this.elements.delete(id); changed.add(id); }
+			for (const [id, element] of next) {
+				const current = this.elements.get(id);
+				if (JSON.stringify(current) === JSON.stringify(element)) continue;
+				this.elements.set(id, current ? { ...current, ...element, id, type: current.type, version: (Number(current.version) || 0) + 1, updated: Date.now() } : { ...element, version: Number(element.version) || 1, updated: Date.now(), isDeleted: false });
+				changed.add(id);
+			}
+		}, { actorId: "human", action: "human_commit" });
+		return { status: changed.size ? "applied" : "no_change", revision: this.revision, changedElementIds: [...changed] };
 	}
 	async status(): Promise<OperationResult> { await this.ensureLoaded(); return { room: this.name, revision: this.revision, elementCount: this.elements.size, active: this.name === todayCanvasRoomName() }; }
 	async listRevisions(): Promise<OperationResult> {
@@ -459,19 +582,55 @@ export class CanvasRoom extends YServer {
 			this.ctx.storage.sql.exec("INSERT INTO canvas_snapshots (id, snapshot_json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET snapshot_json = excluded.snapshot_json", snapshotJson(this.document));
 		});
 		this.revision = nextRevision;
+		this.pruneActivity(Date.now());
 	}
 	private sceneElements(): CanvasElement[] { return [...this.elements.values()].map((element) => JSON.parse(JSON.stringify(element)) as CanvasElement); }
 	private receipt(sessionId: string): { revision: number } | undefined { return Array.from(this.ctx.storage.sql.exec<{ revision: number }>("SELECT revision FROM canvas_read_receipts WHERE session_id = ?", sessionId))[0]; }
 	private changesSince(revision: number): Array<Record<string, unknown>> {
 		return Array.from(this.ctx.storage.sql.exec<{ revision: number; actor: string; action: string; elementIdsJson: string; createdAt: number }>("SELECT revision, actor, action, element_ids_json as elementIdsJson, created_at as createdAt FROM canvas_changes WHERE revision > ? ORDER BY revision ASC LIMIT ?", revision, MAX_DELIVERED_CHANGES + 1)).map((change) => ({ ...change, elementIds: JSON.parse(change.elementIdsJson), elementIdsJson: undefined }));
 	}
-	private recordRead(sessionId: string): void { this.ctx.storage.sql.exec("INSERT INTO canvas_read_receipts (session_id, revision, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, updated_at = excluded.updated_at", sessionId, this.revision, Date.now()); }
-	private storeOperation(operationId: string, result: OperationResult): OperationResult { this.ctx.storage.sql.exec("INSERT INTO canvas_operations (operation_id, result_json, created_at) VALUES (?, ?, ?)", operationId, JSON.stringify(result), Date.now()); return result; }
+	private recordRead(sessionId: string): void { const now = Date.now(); this.ctx.storage.sql.exec("INSERT INTO canvas_read_receipts (session_id, revision, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, updated_at = excluded.updated_at", sessionId, this.revision, now); this.pruneActivity(now); }
+	private storeOperation(operationId: string, result: OperationResult): OperationResult { const now = Date.now(); this.ctx.storage.sql.exec("INSERT INTO canvas_operations (operation_id, result_json, created_at) VALUES (?, ?, ?)", operationId, JSON.stringify(result), now); this.pruneActivity(now); return result; }
 	private persistSnapshot(): void { this.ctx.storage.sql.exec("INSERT INTO canvas_snapshots (id, snapshot_json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET snapshot_json = excluded.snapshot_json", snapshotJson(this.document)); }
+	private consumeRateLimit(ip: string, kind: string, limit: number): boolean {
+		const key = `${kind}:${ip.slice(0, 64)}`;
+		const now = Date.now();
+		const row = Array.from(this.ctx.storage.sql.exec<RateLimitRow>("SELECT window_start as windowStart, count FROM request_limits WHERE key = ?", key))[0];
+		if (!row || row.windowStart <= now - RATE_WINDOW_MS) { this.ctx.storage.sql.exec("INSERT INTO request_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE SET window_start = excluded.window_start, count = excluded.count", key, now); return true; }
+		if (row.count >= limit) return false;
+		this.ctx.storage.sql.exec("UPDATE request_limits SET count = count + 1 WHERE key = ?", key);
+		return true;
+	}
+	private pruneActivity(now: number): void {
+		const oldest = Math.max(0, this.revision - MAX_RETAINED_REVISIONS);
+		this.ctx.storage.sql.exec("DELETE FROM canvas_read_receipts WHERE updated_at < ?", now - ACTIVITY_RETENTION_MS);
+		this.ctx.storage.sql.exec("DELETE FROM canvas_operations WHERE created_at < ?", now - ACTIVITY_RETENTION_MS);
+		this.ctx.storage.sql.exec("DELETE FROM canvas_changes WHERE revision < ?", oldest);
+		this.ctx.storage.sql.exec("DELETE FROM request_limits WHERE window_start < ?", now - RATE_WINDOW_MS * 2);
+	}
 }
 
 async function jsonBody(request: Request): Promise<Record<string, unknown> | null> {
-	try { const body = await request.json(); return body && typeof body === "object" ? body as Record<string, unknown> : null; } catch { return null; }
+	const contentLength = request.headers.get("content-length");
+	if (contentLength && (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_JSON_BODY_BYTES)) return null;
+	if (!request.body) return null;
+	try {
+		const reader = request.body.getReader();
+		const chunks: Uint8Array[] = [];
+		let length = 0;
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			length += value.byteLength;
+			if (length > MAX_JSON_BODY_BYTES) { await reader.cancel(); return null; }
+			chunks.push(value);
+		}
+		const bytes = new Uint8Array(length);
+		let offset = 0;
+		for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+		const body = JSON.parse(new TextDecoder().decode(bytes));
+		return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
+	} catch { return null; }
 }
 function json(result: unknown, status = 200): Response { return Response.json(result, { status, headers: { "Cache-Control": "no-store" } }); }
 function isCurrentDocumentRoomRequest(url: URL): boolean {
@@ -502,12 +661,19 @@ export default {
 			// Do this before PartyServer resolves a Durable Object: otherwise a
 			// public visitor can create arbitrary named rooms just by opening a URL.
 			if (!isCurrentDocumentRoomRequest(url) && !isCurrentCanvasRoomRequest(url)) return new Response("Room not found", { status: 404 });
-			const partyResponse = await routePartykitRequest(request, env);
+			if (!sameOrigin(request)) return new Response("Forbidden", { status: 403 });
+			const room = isCurrentCanvasRoomRequest(url)
+				? await getServerByName<Env, CanvasRoom>(env.CANVAS_ROOM, todayCanvasRoomName())
+				: await getServerByName<Env, DocumentRoom>(env.DOCUMENT_ROOM, todayRoomName());
+			if (!await room.allowClientAction(clientIp(request), "websocket")) return new Response("Too many connections", { status: 429 });
+			const partyResponse = await routePartykitRequest(request, env, { onBeforeConnect: (connectionRequest) => sameOrigin(connectionRequest) ? undefined : new Response("Forbidden", { status: 403 }) });
 			if (partyResponse) return partyResponse;
 		}
 		if (!url.pathname.startsWith("/api/")) return new Response("Not found", { status: 404 });
 		if (url.pathname.startsWith("/api/canvas/")) {
 			const canvas = await getServerByName<Env, CanvasRoom>(env.CANVAS_ROOM, todayCanvasRoomName());
+			if (request.method === "POST" && !sameOrigin(request)) return json({ status: "forbidden" }, 403);
+			if (!await canvas.allowClientAction(clientIp(request), "http")) return json({ status: "rate_limited" }, 429);
 			if (url.pathname === "/api/canvas/status" && request.method === "GET") return json(await canvas.status());
 			if (url.pathname === "/api/canvas/revisions" && request.method === "GET") return json(await canvas.listRevisions());
 			if (request.method !== "POST") return json({ status: "method_not_allowed" }, 405);
@@ -516,11 +682,18 @@ export default {
 			if (url.pathname === "/api/canvas/read") return json(await canvas.readForSession(String(body.sessionId ?? "")));
 			if (url.pathname === "/api/canvas/mutate") {
 				const mutation = canvasMutation(body.mutation);
-				return mutation ? json(await canvas.mutateForSession(String(body.sessionId ?? ""), mutation, String(body.operationId ?? ""), typeof body.actorLabel === "string" ? body.actorLabel.slice(0, 80) : "agent")) : json({ status: "invalid_mutation" }, 400);
+				return mutation ? json(await canvas.mutateForSession(String(body.sessionId ?? ""), mutation, String(body.operationId ?? ""), "WebMCP agent")) : json({ status: "invalid_mutation" }, 400);
+			}
+			if (url.pathname === "/api/canvas/human-commit") {
+				const scene = canvasScene(body.elements);
+				const expectedRevision = asRevision(body.expectedRevision);
+				return scene && expectedRevision !== null ? json(await canvas.commitHumanScene(expectedRevision, scene)) : json({ status: "invalid_scene" }, 400);
 			}
 			return json({ status: "not_found" }, 404);
 		}
 		const room = await getServerByName<Env, DocumentRoom>(env.DOCUMENT_ROOM, todayRoomName());
+		if (request.method === "POST" && !sameOrigin(request)) return json({ status: "forbidden" }, 403);
+		if (!await room.allowClientAction(clientIp(request), "http")) return json({ status: "rate_limited" }, 429);
 		if (url.pathname === "/api/status" && request.method === "GET") return json(await room.status());
 		if (url.pathname === "/api/config" && request.method === "GET") return json({ turnstileSiteKey: env.TURNSTILE_SITE_KEY, turnstileAction: TURNSTILE_ACTION });
 		if (url.pathname === "/api/revisions" && request.method === "GET") return json(await room.listRevisions(asOptionalQuery(url.searchParams.get("query")), asRevision(url.searchParams.get("beforeRevision"))));
@@ -532,11 +705,16 @@ export default {
 		if (url.pathname === "/api/agent/read") return json(await room.readForSession(String(body.sessionId ?? "")));
 		if (url.pathname === "/api/agent/edit") {
 			const replacements = Array.isArray(body.replacements) ? body.replacements.map(asReplacement).filter((item): item is Replacement => item !== null) : [];
-			return json(await room.editForSession(String(body.sessionId ?? ""), replacements, String(body.operationId ?? ""), typeof body.actorLabel === "string" ? body.actorLabel.slice(0, 80) : "agent"));
+			return json(await room.editForSession(String(body.sessionId ?? ""), replacements, String(body.operationId ?? ""), "WebMCP agent"));
+		}
+		if (url.pathname === "/api/human/commit") {
+			return typeof body.baseText === "string" && typeof body.nextText === "string"
+				? json(await room.commitHumanDraft(body.baseText, body.nextText))
+				: json({ status: "invalid_document" }, 400);
 		}
 		if (url.pathname === "/api/revisions/restore-intents") {
 			const revision = asRevision(body.revision);
-			return revision === null ? json({ status: "invalid_revision" }, 400) : json(await room.createRestoreIntent(revision, typeof body.requester === "string" ? body.requester : "human"));
+			return revision === null ? json({ status: "invalid_revision" }, 400) : json(await room.createRestoreIntent(revision, "workspace participant"));
 		}
 		if (url.pathname === "/api/revisions/restore-cancel") {
 			const intentId = safeId(body.intentId);

@@ -19,7 +19,6 @@ const room = `contract-demo-${new Date().toISOString().slice(0, 10)}`;
 const ydoc = new Y.Doc();
 const ytext = ydoc.getText("content");
 const actorId = `human-${crypto.randomUUID().slice(0, 8)}`;
-const approvalOrigin = { actorId };
 const provider = new YProvider(window.location.host, room, ydoc, { party: "document-room", protocol: window.location.protocol === "https:" ? "wss" : "ws", params: { actor: actorId } });
 
 function reconnectAtUtcRollover(): void {
@@ -130,7 +129,7 @@ class ApproveDraftWidget extends WidgetType {
 		button.title = this.disabled ? "Review live changes before approving" : "Publish this draft";
 		button.setAttribute("aria-label", button.title);
 		button.disabled = this.disabled;
-		button.addEventListener("click", approveDraft);
+		button.addEventListener("click", () => void approveDraft());
 		return button;
 	}
 	ignoreEvent(): boolean { return false; }
@@ -199,7 +198,7 @@ function replaceEditorText(next: string): void {
 	editor.dispatch({ changes: { from: 0, to: current.length, insert: next } });
 	syncingEditor = false;
 }
-function approveDraft(): void {
+async function approveDraft(): Promise<void> {
 	if (!hasDraft() || draftIsStale) return;
 	const current = ytext.toString();
 	if (current !== baseText) {
@@ -209,8 +208,20 @@ function approveDraft(): void {
 		return;
 	}
 	const draft = draftText();
-	ydoc.transact(() => { ytext.delete(0, current.length); ytext.insert(0, draft); }, approvalOrigin);
-	addActivity("Approved draft published to the shared document.", "success");
+	try {
+		const result = await api<AgentResult>("/api/human/commit", { baseText, nextText: draft });
+		if (result.status !== "applied" && result.status !== "no_change") {
+			draftIsStale = true;
+			updateDraftUi();
+			addActivity("Live changes arrived before the draft could be approved. Review the latest document first.", "warning");
+			return;
+		}
+		baseText = draft;
+		latestLiveText = draft;
+		draftIsStale = false;
+		updateDraftUi();
+		addActivity("Approved draft published to the shared document.", "success");
+	} catch { addActivity("Could not publish the draft. It remains local; try again after reviewing the live document.", "warning"); }
 }
 function discardDraft(): void {
 	baseText = ytext.toString();
@@ -246,12 +257,6 @@ ytext.observe((event) => {
 	if (next === latestLiveText) return;
 	latestLiveText = next;
 	if (pendingRestore) void cancelPendingRestore("The document changed while the restore was being reviewed. Review the refreshed history before trying again.", true);
-	if (event.transaction.origin === approvalOrigin) {
-		baseText = next;
-		draftIsStale = false;
-		updateDraftUi();
-		return;
-	}
 	if (!hasDraft()) {
 		baseText = next;
 		draftIsStale = false;

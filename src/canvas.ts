@@ -18,6 +18,7 @@ const actorId = `human-${crypto.randomUUID().slice(0, 8)}`;
 const ydoc = new Y.Doc();
 const yelements = ydoc.getMap<CanvasElement>("elements");
 const provider = new YProvider(window.location.host, room, ydoc, { party: "canvas-room", protocol: window.location.protocol === "https:" ? "wss" : "ws", params: { actor: actorId } });
+let currentCanvasRevision: number | null = null;
 
 function elementList(): CanvasElement[] { return [...yelements.values()].map((element) => JSON.parse(JSON.stringify(element)) as CanvasElement); }
 function editableElement(element: CanvasElement): CanvasElement {
@@ -37,7 +38,7 @@ const activity = required<HTMLOListElement>("canvas-activity");
 const revisionHistory = required<HTMLOListElement>("canvas-revisions");
 function addActivity(message: string, kind: "success" | "warning" | "info" = "info"): void { const item = document.createElement("li"); item.className = kind; item.textContent = message; activity.appendChild(item); while (activity.children.length > 6) activity.firstElementChild?.remove(); }
 async function api<T extends CanvasResult>(path: string, body?: Record<string, unknown>): Promise<T> { const response = await fetch(path, { method: body ? "POST" : "GET", headers: body ? { "content-type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined }); if (!response.ok) throw new Error(`Request failed (${response.status})`); return await response.json() as T; }
-async function refreshStatus(): Promise<void> { try { const status = await api<CanvasResult>("/api/canvas/status"); revisionLabel.textContent = `Revision ${status.revision ?? "—"}`; } catch { revisionLabel.textContent = "Revision unavailable"; } }
+async function refreshStatus(): Promise<void> { try { const status = await api<CanvasResult>("/api/canvas/status"); currentCanvasRevision = typeof status.revision === "number" ? status.revision : null; revisionLabel.textContent = `Revision ${status.revision ?? "—"}`; } catch { currentCanvasRevision = null; revisionLabel.textContent = "Revision unavailable"; } }
 function revisionLabelFor(change: CanvasRevision): string { return change.action.replaceAll("_", " "); }
 async function refreshRevisions(): Promise<void> {
 	try {
@@ -90,7 +91,7 @@ function Canvas(): React.ReactElement {
 	const [draftState, setDraftState] = React.useState<"clean" | "pending" | "stale">("clean");
 	const [draftChangeCount, setDraftChangeCount] = React.useState(0);
 	const liveElements = React.useRef<CanvasElement[]>([]);
-	const commitOrigin = React.useRef({ actorId, action: "human_commit" });
+	const pendingCommitScene = React.useRef<string | null>(null);
 	const applyingLiveScene = React.useRef(false);
 	const humanInputUntil = React.useRef(0);
 	const sceneKey = (elements: readonly CanvasElement[]) => JSON.stringify([...elements].filter((element) => !element.isDeleted).map(editableElement).sort((a, b) => a.id.localeCompare(b.id)));
@@ -109,22 +110,30 @@ function Canvas(): React.ReactElement {
 		return new Set([...live.keys(), ...next.keys()].filter((id) => !sameEditableElement(live.get(id), next.get(id)))).size;
 	};
 	const discardDraft = () => { applyLiveScene(liveElements.current); setDraftState("clean"); setDraftChangeCount(0); addActivity("Draft discarded; the live canvas is visible again."); };
-	const commitDraft = () => {
+	const commitDraft = async () => {
 		if (draftState !== "pending" || !apiRef.current) return;
 		const draft = apiRef.current.getSceneElementsIncludingDeleted() as unknown as CanvasElement[];
-		const next = new Map(draft.filter((element) => !element.isDeleted).map((element) => [element.id, JSON.parse(JSON.stringify(element)) as CanvasElement]));
-		ydoc.transact(() => {
-			for (const id of [...yelements.keys()]) if (!next.has(id)) yelements.delete(id);
-		for (const [id, element] of next) {
-			const current = yelements.get(id);
-			if (!sameEditableElement(current, element)) yelements.set(id, current ? { ...current, ...element } : element);
-		}
-		}, commitOrigin.current);
-		liveElements.current = elementList();
-		setDraftState("clean");
-		setDraftChangeCount(0);
-		addActivity("Human draft committed to the shared canvas.", "success");
-		void refreshRevisions();
+		const draftKey = sceneKey(draft);
+		if (currentCanvasRevision === null) { await refreshStatus(); }
+		if (currentCanvasRevision === null) { addActivity("Could not verify the live canvas revision. Try again.", "warning"); return; }
+		pendingCommitScene.current = draftKey;
+		try {
+			const result = await api<CanvasResult>("/api/canvas/human-commit", { expectedRevision: currentCanvasRevision, elements: draft.filter((element) => !element.isDeleted) });
+			if (result.status === "stale") {
+				pendingCommitScene.current = null;
+				setDraftState("stale");
+				if (result.elements) applyLiveScene(result.elements);
+				addActivity("The live canvas changed before this draft was committed. Review it before retrying.", "warning");
+				return;
+			}
+			if (result.status !== "applied" && result.status !== "no_change") { pendingCommitScene.current = null; addActivity("Could not commit the draft. It remains local.", "warning"); return; }
+			if (result.status === "no_change") pendingCommitScene.current = null;
+			currentCanvasRevision = typeof result.revision === "number" ? result.revision : currentCanvasRevision;
+			setDraftState("clean");
+			setDraftChangeCount(0);
+			addActivity("Human draft committed to the shared canvas.", "success");
+			void refreshRevisions();
+		} catch { pendingCommitScene.current = null; addActivity("Could not commit the draft. It remains local.", "warning"); }
 	};
 	React.useEffect(() => {
 		const root = required<HTMLElement>("excalidraw-root");
@@ -134,13 +143,13 @@ function Canvas(): React.ReactElement {
 		return () => { root.removeEventListener("pointerdown", recordHumanInput, true); root.removeEventListener("keydown", recordHumanInput, true); };
 	}, []);
 	React.useEffect(() => {
-		const syncScene = (origin?: unknown) => {
+		const syncScene = () => {
 			const next = elementList();
-			if (origin === commitOrigin.current) { liveElements.current = next; return; }
+			if (pendingCommitScene.current === sceneKey(next)) { pendingCommitScene.current = null; liveElements.current = next; return; }
 			if (draftState === "pending") { setDraftState("stale"); addActivity("Live changes arrived while your draft is pending. Review or discard it before committing.", "warning"); return; }
 			applyLiveScene(next);
 		};
-		const observer = (event: Y.YMapEvent<CanvasElement>) => syncScene(event.transaction.origin);
+		const observer = () => syncScene();
 		yelements.observe(observer);
 		const synced = () => { liveElements.current = elementList(); setReady(true); queueMicrotask(() => applyLiveScene(liveElements.current)); };
 		provider.on("synced", synced);
@@ -160,10 +169,10 @@ function Canvas(): React.ReactElement {
 	});
 	const controls = React.createElement(React.Fragment, null,
 		React.createElement("p", { className: `draft-status ${draftState}` }, draftState === "clean" ? "No pending human draft." : draftState === "pending" ? "Your changes are local. Commit when ready." : "The live canvas changed. Discard this draft to review it."),
-		React.createElement("button", { type: "button", disabled: draftState !== "pending", onClick: commitDraft }, "Commit human changes"),
+		React.createElement("button", { type: "button", disabled: draftState !== "pending", onClick: () => void commitDraft() }, "Commit human changes"),
 		React.createElement("button", { type: "button", className: "secondary", disabled: draftState === "clean", onClick: discardDraft }, "Discard draft")
 	);
-	const overlay = draftState === "clean" ? null : React.createElement("button", { type: "button", className: "canvas-commit-float", disabled: draftState !== "pending", onClick: commitDraft, title: draftState === "pending" ? "Publish your local canvas changes" : "Discard your draft to review the incoming live change" },
+	const overlay = draftState === "clean" ? null : React.createElement("button", { type: "button", className: "canvas-commit-float", disabled: draftState !== "pending", onClick: () => void commitDraft(), title: draftState === "pending" ? "Publish your local canvas changes" : "Discard your draft to review the incoming live change" },
 		React.createElement("span", { className: "canvas-commit-check", "aria-hidden": "true" }, draftState === "pending" ? "✓" : "!"),
 		draftState === "pending" ? `Commit ${draftChangeCount || "local"} change${draftChangeCount === 1 ? "" : "s"}` : "Live change needs review"
 	);
