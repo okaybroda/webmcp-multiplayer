@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve Canvas Relay.
+Thanks for helping improve HumanAgentMultiplayer.
 
 - Keep the demos safe for a public shared room: do not add credentials, personal data, or private documents.
 - Preserve the agent freshness model. Browser-visible WebMCP tools should not expose internal session IDs or let stale agents silently overwrite another participant's work.

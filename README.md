@@ -1,6 +1,6 @@
-# Canvas Relay
+# HumanAgentMultiplayer
 
-Canvas Relay is an open-source WebMCP demonstration of **multiple people and their agents collaborating in the same live workspace**. It includes two public daily demos: a shared contract editor and a visual Excalidraw canvas.
+HumanAgentMultiplayer is an open-source WebMCP demonstration of **multiple people and their agents collaborating in the same live workspace**. It includes two public daily demos: a shared contract editor and a visual Excalidraw canvas.
 
 ## What it demonstrates
 
@@ -9,7 +9,7 @@ Canvas Relay is an open-source WebMCP demonstration of **multiple people and the
 - The browser keeps an opaque freshness receipt for each agent, preventing accidental stale agent edits.
 - Realtime Yjs state is coordinated and durably snapshotted by per-demo Cloudflare Durable Objects.
 
-### Canvas Relay
+### Visual canvas demo
 
 `/canvas/` is a MIT-licensed Excalidraw integration for real-time visual collaboration. It uses a dedicated daily Yjs room and hibernating Durable Object, isolated from the contract editor.
 
