@@ -96,9 +96,13 @@ let baseText = ytext.toString();
 let latestLiveText = baseText;
 let syncingEditor = false;
 let draftIsStale = false;
+let incomingChangeGate = false;
+let incomingChangeTimer: number | null = null;
+let incomingChange: { from: number; to: number; removedText: string } | null = null;
 let decorationRefreshScheduled = false;
 
 type DraftHunk = { baseFrom: number; baseTo: number; draftFrom: number; draftTo: number; oldText: string; newText: string };
+type TextChange = { baseFrom: number; baseTo: number; variantFrom: number; variantTo: number; oldText: string; newText: string };
 const setDraftDecorations = StateEffect.define<DecorationSet>();
 const draftDecorationField = StateField.define<DecorationSet>({
 	create: () => Decoration.none,
@@ -118,6 +122,17 @@ class RemovedTextWidget extends WidgetType {
 	}
 	ignoreEvent(): boolean { return false; }
 }
+class IncomingRemovedTextWidget extends WidgetType {
+	constructor(readonly text: string, readonly pulsing: boolean) { super(); }
+	eq(other: IncomingRemovedTextWidget): boolean { return this.text === other.text && this.pulsing === other.pulsing; }
+	toDOM(): HTMLElement {
+		const line = document.createElement("div");
+		line.className = `cm-live-change cm-live-change-removed${this.pulsing ? " cm-live-change-pulse" : ""}`;
+		line.textContent = `Live change: − ${this.text || "(empty line)"}`;
+		return line;
+	}
+	ignoreEvent(): boolean { return false; }
+}
 class ApproveDraftWidget extends WidgetType {
 	constructor(readonly disabled: boolean) { super(); }
 	eq(other: ApproveDraftWidget): boolean { return this.disabled === other.disabled; }
@@ -126,7 +141,7 @@ class ApproveDraftWidget extends WidgetType {
 		button.type = "button";
 		button.className = "cm-draft-approve";
 		button.textContent = "✓";
-		button.title = this.disabled ? "Review live changes before approving" : "Publish this draft";
+		button.title = this.disabled ? "Live changes are being highlighted" : "Publish this draft";
 		button.setAttribute("aria-label", button.title);
 		button.disabled = this.disabled;
 		button.addEventListener("click", () => void approveDraft());
@@ -137,6 +152,21 @@ class ApproveDraftWidget extends WidgetType {
 
 function draftText(): string { return editor.state.doc.toString(); }
 function hasDraft(): boolean { return draftText() !== baseText; }
+function textChange(base: string, variant: string): TextChange | null {
+	if (base === variant) return null;
+	let prefix = 0;
+	while (prefix < base.length && prefix < variant.length && base[prefix] === variant[prefix]) prefix += 1;
+	let baseSuffix = base.length;
+	let variantSuffix = variant.length;
+	while (baseSuffix > prefix && variantSuffix > prefix && base[baseSuffix - 1] === variant[variantSuffix - 1]) {
+		baseSuffix -= 1;
+		variantSuffix -= 1;
+	}
+	return {
+		baseFrom: prefix, baseTo: baseSuffix, variantFrom: prefix, variantTo: variantSuffix,
+		oldText: base.slice(prefix, baseSuffix), newText: variant.slice(prefix, variantSuffix),
+	};
+}
 function lineStart(text: string, position: number): number { return text.lastIndexOf("\n", Math.max(0, position - 1)) + 1; }
 function lineEnd(text: string, position: number): number {
 	const end = text.indexOf("\n", Math.min(position, text.length));
@@ -144,28 +174,28 @@ function lineEnd(text: string, position: number): number {
 }
 function draftHunk(): DraftHunk | null {
 	const draft = draftText();
-	if (draft === baseText) return null;
-	let prefix = 0;
-	while (prefix < baseText.length && prefix < draft.length && baseText[prefix] === draft[prefix]) prefix += 1;
-	let baseSuffix = baseText.length;
-	let draftSuffix = draft.length;
-	while (baseSuffix > prefix && draftSuffix > prefix && baseText[baseSuffix - 1] === draft[draftSuffix - 1]) {
-		baseSuffix -= 1;
-		draftSuffix -= 1;
-	}
-	const baseFrom = lineStart(baseText, prefix);
-	const baseTo = lineEnd(baseText, baseSuffix);
-	const draftFrom = lineStart(draft, prefix);
-	const draftTo = lineEnd(draft, draftSuffix);
+	const change = textChange(baseText, draft);
+	if (!change) return null;
+	const baseFrom = lineStart(baseText, change.baseFrom);
+	const baseTo = lineEnd(baseText, change.baseTo);
+	const draftFrom = lineStart(draft, change.variantFrom);
+	const draftTo = lineEnd(draft, change.variantTo);
 	return { baseFrom, baseTo, draftFrom, draftTo, oldText: baseText.slice(baseFrom, baseTo), newText: draft.slice(draftFrom, draftTo) };
 }
 function buildDraftDecorations(): DecorationSet {
 	const hunk = draftHunk();
-	if (!hunk) return Decoration.none;
 	const decorations: Range<Decoration>[] = [];
-	if (hunk.oldText) decorations.push(Decoration.widget({ widget: new RemovedTextWidget(hunk.oldText), block: true, side: -1 }).range(hunk.draftFrom));
-	if (hunk.draftFrom < hunk.draftTo) decorations.push(Decoration.mark({ class: "cm-draft-added" }).range(hunk.draftFrom, hunk.draftTo));
-	decorations.push(Decoration.widget({ widget: new ApproveDraftWidget(draftIsStale), side: 1 }).range(hunk.draftTo));
+	if (hunk) {
+		if (hunk.oldText) decorations.push(Decoration.widget({ widget: new RemovedTextWidget(hunk.oldText), block: true, side: -1 }).range(hunk.draftFrom));
+		if (hunk.draftFrom < hunk.draftTo) decorations.push(Decoration.mark({ class: "cm-draft-added" }).range(hunk.draftFrom, hunk.draftTo));
+		decorations.push(Decoration.widget({ widget: new ApproveDraftWidget(draftIsStale || incomingChangeGate), side: 1 }).range(hunk.draftTo));
+	}
+	if (incomingChange) {
+		const className = incomingChangeGate ? "cm-live-change cm-live-change-pulse" : "cm-live-change";
+		if (incomingChange.removedText) decorations.push(Decoration.widget({ widget: new IncomingRemovedTextWidget(incomingChange.removedText, incomingChangeGate), block: true, side: -1 }).range(incomingChange.from));
+		if (incomingChange.from < incomingChange.to) decorations.push(Decoration.mark({ class: className }).range(incomingChange.from, incomingChange.to));
+	}
+	if (!decorations.length) return Decoration.none;
 	return Decoration.set(decorations, true);
 }
 function refreshDraftDecorations(): void {
@@ -181,7 +211,13 @@ function updateDraftUi(): void {
 	discardDraftButton.disabled = !pending && !draftIsStale;
 	if (draftIsStale) {
 		draftStatus.className = "draft-status warning";
-		draftStatus.textContent = "Live changes arrived while you drafted. Discard the draft to review the latest document.";
+		draftStatus.textContent = "A live edit overlaps your draft. Discard the draft to review the latest document.";
+	} else if (incomingChangeGate) {
+		draftStatus.className = "draft-status warning";
+		draftStatus.textContent = "A live change was merged into your draft and is highlighted in yellow. The ✓ unlocks in a moment.";
+	} else if (incomingChange) {
+		draftStatus.className = "draft-status warning";
+		draftStatus.textContent = "A live change was merged into your draft. Review the yellow highlight, then click its ✓ to publish.";
 	} else if (pending) {
 		draftStatus.className = "draft-status pending";
 		draftStatus.textContent = "Draft shown inline. Click its ✓ to publish it.";
@@ -199,7 +235,7 @@ function replaceEditorText(next: string): void {
 	syncingEditor = false;
 }
 async function approveDraft(): Promise<void> {
-	if (!hasDraft() || draftIsStale) return;
+	if (!hasDraft() || draftIsStale || incomingChangeGate) return;
 	const current = ytext.toString();
 	if (current !== baseText) {
 		draftIsStale = true;
@@ -219,17 +255,58 @@ async function approveDraft(): Promise<void> {
 		baseText = draft;
 		latestLiveText = draft;
 		draftIsStale = false;
+		incomingChange = null;
 		updateDraftUi();
 		addActivity("Approved draft published to the shared document.", "success");
 	} catch { addActivity("Could not publish the draft. It remains local; try again after reviewing the live document.", "warning"); }
 }
 function discardDraft(): void {
+	if (incomingChangeTimer !== null) window.clearTimeout(incomingChangeTimer);
+	incomingChangeTimer = null;
 	baseText = ytext.toString();
 	latestLiveText = baseText;
 	draftIsStale = false;
+	incomingChangeGate = false;
+	incomingChange = null;
 	replaceEditorText(baseText);
 	updateDraftUi();
 	addActivity("Draft discarded. The editor now shows the live document.");
+}
+
+function changesOverlap(left: TextChange, right: TextChange): boolean {
+	if (left.baseFrom === left.baseTo || right.baseFrom === right.baseTo) return left.baseFrom === right.baseFrom;
+	return left.baseFrom < right.baseTo && right.baseFrom < left.baseTo;
+}
+function rebaseDraftOntoLiveDocument(next: string): boolean {
+	const draft = draftText();
+	const previousBase = baseText;
+	const localChange = textChange(baseText, draft);
+	const liveChange = textChange(baseText, next);
+	if (!localChange || !liveChange || changesOverlap(localChange, liveChange)) return false;
+	const liveBeforeLocal = liveChange.baseTo <= localChange.baseFrom;
+	const localStart = localChange.baseFrom + (liveBeforeLocal ? liveChange.newText.length - liveChange.oldText.length : 0);
+	const localEnd = localStart + localChange.oldText.length;
+	const merged = `${next.slice(0, localStart)}${localChange.newText}${next.slice(localEnd)}`;
+	const liveLineStart = lineStart(next, liveChange.variantFrom);
+	const liveLineEnd = lineEnd(next, liveChange.variantTo);
+	const liveStart = liveLineStart + (!liveBeforeLocal ? localChange.newText.length - localChange.oldText.length : 0);
+	baseText = next;
+	latestLiveText = next;
+	draftIsStale = false;
+	incomingChange = {
+		from: liveStart,
+		to: liveStart + (liveLineEnd - liveLineStart),
+		removedText: previousBase.slice(lineStart(previousBase, liveChange.baseFrom), lineEnd(previousBase, liveChange.baseTo)),
+	};
+	incomingChangeGate = true;
+	if (incomingChangeTimer !== null) window.clearTimeout(incomingChangeTimer);
+	incomingChangeTimer = window.setTimeout(() => {
+		incomingChangeGate = false;
+		incomingChangeTimer = null;
+		updateDraftUi();
+	}, 3000);
+	replaceEditorText(merged);
+	return true;
 }
 
 editor = new EditorView({
@@ -265,9 +342,14 @@ ytext.observe((event) => {
 		addActivity("Live document update received.");
 		return;
 	}
+	if (rebaseDraftOntoLiveDocument(next)) {
+		updateDraftUi();
+		addActivity("Live change merged into the pending draft and highlighted in yellow.", "warning");
+		return;
+	}
 	draftIsStale = true;
 	updateDraftUi();
-	addActivity("Live changes arrived while a draft is pending.", "warning");
+	addActivity("A live change overlaps the pending draft. Review it before publishing.", "warning");
 });
 
 let historyBeforeRevision: number | null = null;
@@ -414,6 +496,7 @@ class AgentBridge {
 	readonly sessionId = crypto.randomUUID().replaceAll("-", "");
 	constructor(readonly label: string) {}
 	read(): Promise<ReadResult> { return api<ReadResult>("/api/agent/read", { sessionId: this.sessionId }); }
+	changes(): Promise<AgentResult> { return api<AgentResult>("/api/agent/changes", { sessionId: this.sessionId }); }
 	edit(replacements: Replacement[]): Promise<AgentResult> { return api<AgentResult>("/api/agent/edit", { sessionId: this.sessionId, replacements, operationId: crypto.randomUUID().replaceAll("-", ""), actorLabel: this.label }); }
 	listRevisions(query?: string, beforeRevision?: number): Promise<AgentResult> {
 		const search = new URLSearchParams(); if (query) search.set("query", query); if (beforeRevision !== undefined) search.set("beforeRevision", String(beforeRevision));
@@ -450,8 +533,10 @@ async function runDemo(): Promise<void> {
 		addActivity(`Agent A changed total consideration to ${aChange.amount}.`, "success");
 		const bChange = nextAmountLine(bRead.content, "Payment due at signing");
 		const staleResult = await agentB.edit([bChange.replacement]);
-		if (staleResult.status !== "changes_since_read") throw new Error(`Expected freshness check, got ${staleResult.status}`);
-		addActivity("Agent B was given Agent A’s change before its edit could run.", "warning");
+		if (staleResult.status !== "changes_available") throw new Error(`Expected freshness check, got ${staleResult.status}`);
+		const changes = await agentB.changes();
+		if (changes.status !== "changes_since_read") throw new Error(`Expected changes, got ${changes.status}`);
+		addActivity("Agent B reviewed Agent A’s change before its edit could run.", "warning");
 		const retryResult = await agentB.edit([bChange.replacement]);
 		if (retryResult.status !== "applied") throw new Error(`Agent B retry: ${retryResult.status}`);
 		addActivity(`Agent B reconciled the update and changed signing payment to ${bChange.amount}.`, "success");
@@ -466,9 +551,10 @@ function registerWebMcpTools(): void {
 	const modelContext = (document as Document & { modelContext?: ModelContext }).modelContext;
 	if (!modelContext) { webmcpStatus.textContent = "No compatible WebMCP host detected. The live document still works normally."; return; }
 	const agent = new AgentBridge("WebMCP agent");
-	modelContext.registerTool({ name: "read_document", description: "Read the shared contract. The first call returns the full document. Later calls in the same session return only changes since the previous read when there are at most 20; otherwise they return the full document again.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, execute: async () => toolResult(await agent.read()) });
+	modelContext.registerTool({ name: "read_document", description: "Read the full current shared contract and record the browser-held read receipt. Call this before proposing or making an edit, and again when read_changes_since_last_read asks for a reread.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, execute: async () => toolResult(await agent.read()) });
+	modelContext.registerTool({ name: "read_changes_since_last_read", description: "Read structured changes made since this agent last called read_document or this tool. Call this when an edit reports changes_available. If more than 20 changes arrived, it asks you to call read_document for a new full snapshot.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, execute: async () => toolResult(await agent.changes()) });
 	modelContext.registerTool({
-		name: "edit_document", description: "Apply line replacements. Each replacement must include the exact current text expected at its target. When making changes, make sure the document is coherent. If the changes you are about to make contradict the document, ask the human to verify.",
+		name: "edit_document", description: "Apply line replacements. Each replacement must include the exact current text expected at its target. If this returns changes_available, call read_changes_since_last_read and only retry if the edit remains coherent. If the changes contradict your plan, ask the human to verify.",
 		inputSchema: { type: "object", required: ["replacements"], properties: { replacements: { type: "array", items: { type: "object", required: ["startLine", "endLine", "expectedText", "text"], properties: { startLine: { type: "integer", minimum: 1 }, endLine: { type: "integer", minimum: 1 }, expectedText: { type: "string" }, text: { type: "string" } } } } } },
 		execute: async (input) => {
 			const replacements = input && typeof input === "object" && Array.isArray((input as { replacements?: unknown }).replacements) ? (input as { replacements: Replacement[] }).replacements : [];
@@ -498,7 +584,7 @@ function registerWebMcpTools(): void {
 			return toolResult(safeResult);
 		},
 	});
-	webmcpStatus.textContent = "Tools registered: read_document, edit_document, list_revisions, read_revision, request_restore_revision.";
+	webmcpStatus.textContent = "Tools registered: read_document, read_changes_since_last_read, edit_document, list_revisions, read_revision, request_restore_revision.";
 }
 openInCodexButton.addEventListener("click", () => void openInCodex());
 discardDraftButton.addEventListener("click", discardDraft);

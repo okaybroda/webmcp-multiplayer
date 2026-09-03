@@ -14,8 +14,11 @@ const MAX_CANVAS_SCENE_BYTES = 256_000;
 const MAX_JSON_BODY_BYTES = 256_000;
 const MAX_WEBSOCKET_MESSAGE_BYTES = 128_000;
 const RATE_WINDOW_MS = 60_000;
-const MAX_HTTP_REQUESTS_PER_WINDOW = 90;
-const MAX_WEBSOCKET_CONNECTIONS_PER_WINDOW = 24;
+// These are intentionally shared by all visitors in a public daily demo room.
+// The room's Durable Object serializes access, so its SQLite counters give us a
+// simple global budget without collecting or persisting client IP addresses.
+const MAX_GLOBAL_HTTP_REQUESTS_PER_WINDOW = 300;
+const MAX_GLOBAL_WEBSOCKET_CONNECTIONS_PER_WINDOW = 60;
 const MAX_WEBSOCKET_MESSAGES_PER_WINDOW = 120;
 const ACTIVITY_RETENTION_MS = 6 * 60 * 60 * 1_000;
 const MAX_RETAINED_REVISIONS = 100;
@@ -75,7 +78,6 @@ function asRevision(value: unknown): number | null {
 }
 function asOptionalQuery(value: string | null): string { return (value ?? "").trim().slice(0, MAX_HISTORY_QUERY_LENGTH); }
 function snapshotJson(document: Y.Doc): string { return JSON.stringify(Array.from(Y.encodeStateAsUpdate(document))); }
-function clientIp(request: Request): string { return request.headers.get("CF-Connecting-IP")?.slice(0, 64) || "local"; }
 function sameOrigin(request: Request): boolean {
 	const origin = request.headers.get("Origin");
 	if (origin === "https://webmcp-demo.rakanlabs.com") return true;
@@ -255,28 +257,26 @@ export class DocumentRoom extends YServer {
 		if (!allowWebSocketMessage(connection)) { connection.close(1008, "WebSocket message rate exceeded"); return; }
 		super.onMessage(connection, message);
 	}
-	async allowClientAction(ip: string, kind: "http" | "websocket"): Promise<boolean> {
+	async allowClientAction(kind: "http" | "websocket"): Promise<boolean> {
 		if (!this.started) await this.onStart();
-		const limit = kind === "http" ? MAX_HTTP_REQUESTS_PER_WINDOW : MAX_WEBSOCKET_CONNECTIONS_PER_WINDOW;
-		return this.consumeRateLimit(ip, kind, limit);
+		const limit = kind === "http" ? MAX_GLOBAL_HTTP_REQUESTS_PER_WINDOW : MAX_GLOBAL_WEBSOCKET_CONNECTIONS_PER_WINDOW;
+		return this.consumeRateLimit(kind, limit);
 	}
 
 	async readForSession(sessionId: string): Promise<OperationResult> {
 		if (!safeId(sessionId)) return { status: "invalid_session" };
-		const receipt = Array.from(this.ctx.storage.sql.exec<{ revision: number }>("SELECT revision FROM read_receipts WHERE session_id = ?", sessionId))[0];
-		if (receipt && receipt.revision === this.revision) {
-			this.recordRead(sessionId);
-			return { status: "up_to_date", revision: this.revision };
-		}
-		if (receipt) {
-			const rows = Array.from(this.ctx.storage.sql.exec<StoredChange>("SELECT revision, actor, start_line as startLine, end_line as endLine, old_text as oldText, new_text as newText, truncated, created_at as createdAt FROM changes WHERE revision > ? ORDER BY revision ASC LIMIT ?", receipt.revision, MAX_DELIVERED_CHANGES + 1));
-			if (rows.length <= MAX_DELIVERED_CHANGES) {
-				this.recordRead(sessionId);
-				return { status: "changes_since_read", fromRevision: receipt.revision, currentRevision: this.revision, changes: rows.map((change) => ({ ...change, truncated: Boolean(change.truncated) })) };
-			}
-		}
 		this.recordRead(sessionId);
 		return { status: "ok", revision: this.revision, content: this.document.getText("content").toString() };
+	}
+	async changesSinceLastRead(sessionId: string): Promise<OperationResult> {
+		if (!safeId(sessionId)) return { status: "invalid_session" };
+		const receipt = Array.from(this.ctx.storage.sql.exec<{ revision: number }>("SELECT revision FROM read_receipts WHERE session_id = ?", sessionId))[0];
+		if (!receipt) return { status: "read_required", message: "Call read_document before requesting changes." };
+		if (receipt.revision === this.revision) { this.recordRead(sessionId); return { status: "up_to_date", revision: this.revision }; }
+		const rows = Array.from(this.ctx.storage.sql.exec<StoredChange>("SELECT revision, actor, start_line as startLine, end_line as endLine, old_text as oldText, new_text as newText, truncated, created_at as createdAt FROM changes WHERE revision > ? ORDER BY revision ASC LIMIT ?", receipt.revision, MAX_DELIVERED_CHANGES + 1));
+		if (rows.length > MAX_DELIVERED_CHANGES) return { status: "reread_required", currentRevision: this.revision, message: "More than 20 changes arrived. Call read_document for the current document." };
+		this.recordRead(sessionId);
+		return { status: "changes_since_read", fromRevision: receipt.revision, currentRevision: this.revision, changes: rows.map((change) => ({ ...change, truncated: Boolean(change.truncated) })) };
 	}
 	async editForSession(sessionId: string, replacements: Replacement[], operationId: string, actorLabel = "agent"): Promise<OperationResult> {
 		if (!safeId(sessionId) || !safeId(operationId)) return { status: "invalid_request" };
@@ -288,9 +288,8 @@ export class DocumentRoom extends YServer {
 		if (!receipt) return this.storeOperation(operationId, { status: "read_required" });
 		if (receipt.revision < this.revision) {
 			const rows = Array.from(this.ctx.storage.sql.exec<StoredChange>("SELECT revision, actor, start_line as startLine, end_line as endLine, old_text as oldText, new_text as newText, truncated, created_at as createdAt FROM changes WHERE revision > ? ORDER BY revision ASC LIMIT ?", receipt.revision, MAX_DELIVERED_CHANGES + 1));
-			if (rows.length > MAX_DELIVERED_CHANGES) return this.storeOperation(operationId, { status: "reread_required", currentRevision: this.revision, message: "More than 20 changes arrived since this agent last read the document." });
-			this.recordRead(sessionId);
-			return this.storeOperation(operationId, { status: "changes_since_read", currentRevision: this.revision, changes: rows.map((change) => ({ ...change, truncated: Boolean(change.truncated) })), message: "These are changes made since your last read. If your edits contradict these changes, escalate to a human instead of overwriting them or making the document inconsistent." });
+			if (rows.length > MAX_DELIVERED_CHANGES) return this.storeOperation(operationId, { status: "reread_required", currentRevision: this.revision, message: "More than 20 changes arrived since this agent last read the document. Call read_document again." });
+			return this.storeOperation(operationId, { status: "changes_available", currentRevision: this.revision, message: "The document changed since your last read. Call read_changes_since_last_read before retrying this edit." });
 		}
 		const current = this.document.getText("content").toString();
 		const application = applyReplacements(current, replacements);
@@ -401,8 +400,8 @@ export class DocumentRoom extends YServer {
 	private recordRead(sessionId: string): void { const now = Date.now(); this.ctx.storage.sql.exec("INSERT INTO read_receipts (session_id, revision, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, updated_at = excluded.updated_at", sessionId, this.revision, now); this.pruneActivity(now); }
 	private storeOperation(operationId: string, result: OperationResult): OperationResult { const now = Date.now(); this.ctx.storage.sql.exec("INSERT INTO operations (operation_id, result_json, created_at) VALUES (?, ?, ?)", operationId, JSON.stringify(result), now); this.pruneActivity(now); return result; }
 	private persistSnapshot(): void { this.ctx.storage.sql.exec("INSERT INTO room_state (id, revision, snapshot_json) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, snapshot_json = excluded.snapshot_json", this.revision, snapshotJson(this.document)); }
-	private consumeRateLimit(ip: string, kind: string, limit: number): boolean {
-		const key = `${kind}:${ip.slice(0, 64)}`;
+	private consumeRateLimit(kind: string, limit: number): boolean {
+		const key = kind;
 		const now = Date.now();
 		const row = Array.from(this.ctx.storage.sql.exec<RateLimitRow>("SELECT window_start as windowStart, count FROM request_limits WHERE key = ?", key))[0];
 		if (!row || row.windowStart <= now - RATE_WINDOW_MS) { this.ctx.storage.sql.exec("INSERT INTO request_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE SET window_start = excluded.window_start, count = excluded.count", key, now); return true; }
@@ -465,10 +464,10 @@ export class CanvasRoom extends YServer {
 		if (!allowWebSocketMessage(connection)) { connection.close(1008, "WebSocket message rate exceeded"); return; }
 		super.onMessage(connection, message);
 	}
-	async allowClientAction(ip: string, kind: "http" | "websocket"): Promise<boolean> {
+	async allowClientAction(kind: "http" | "websocket"): Promise<boolean> {
 		await this.ensureLoaded();
-		const limit = kind === "http" ? MAX_HTTP_REQUESTS_PER_WINDOW : MAX_WEBSOCKET_CONNECTIONS_PER_WINDOW;
-		return this.consumeRateLimit(ip, kind, limit);
+		const limit = kind === "http" ? MAX_GLOBAL_HTTP_REQUESTS_PER_WINDOW : MAX_GLOBAL_WEBSOCKET_CONNECTIONS_PER_WINDOW;
+		return this.consumeRateLimit(kind, limit);
 	}
 
 	async readForSession(sessionId: string): Promise<OperationResult> {
@@ -592,8 +591,8 @@ export class CanvasRoom extends YServer {
 	private recordRead(sessionId: string): void { const now = Date.now(); this.ctx.storage.sql.exec("INSERT INTO canvas_read_receipts (session_id, revision, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, updated_at = excluded.updated_at", sessionId, this.revision, now); this.pruneActivity(now); }
 	private storeOperation(operationId: string, result: OperationResult): OperationResult { const now = Date.now(); this.ctx.storage.sql.exec("INSERT INTO canvas_operations (operation_id, result_json, created_at) VALUES (?, ?, ?)", operationId, JSON.stringify(result), now); this.pruneActivity(now); return result; }
 	private persistSnapshot(): void { this.ctx.storage.sql.exec("INSERT INTO canvas_snapshots (id, snapshot_json) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET snapshot_json = excluded.snapshot_json", snapshotJson(this.document)); }
-	private consumeRateLimit(ip: string, kind: string, limit: number): boolean {
-		const key = `${kind}:${ip.slice(0, 64)}`;
+	private consumeRateLimit(kind: string, limit: number): boolean {
+		const key = kind;
 		const now = Date.now();
 		const row = Array.from(this.ctx.storage.sql.exec<RateLimitRow>("SELECT window_start as windowStart, count FROM request_limits WHERE key = ?", key))[0];
 		if (!row || row.windowStart <= now - RATE_WINDOW_MS) { this.ctx.storage.sql.exec("INSERT INTO request_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE SET window_start = excluded.window_start, count = excluded.count", key, now); return true; }
@@ -665,7 +664,7 @@ export default {
 			const room = isCurrentCanvasRoomRequest(url)
 				? await getServerByName<Env, CanvasRoom>(env.CANVAS_ROOM, todayCanvasRoomName())
 				: await getServerByName<Env, DocumentRoom>(env.DOCUMENT_ROOM, todayRoomName());
-			if (!await room.allowClientAction(clientIp(request), "websocket")) return new Response("Too many connections", { status: 429 });
+			if (!await room.allowClientAction("websocket")) return new Response("Too many connections", { status: 429 });
 			const partyResponse = await routePartykitRequest(request, env, { onBeforeConnect: (connectionRequest) => sameOrigin(connectionRequest) ? undefined : new Response("Forbidden", { status: 403 }) });
 			if (partyResponse) return partyResponse;
 		}
@@ -673,7 +672,7 @@ export default {
 		if (url.pathname.startsWith("/api/canvas/")) {
 			const canvas = await getServerByName<Env, CanvasRoom>(env.CANVAS_ROOM, todayCanvasRoomName());
 			if (request.method === "POST" && !sameOrigin(request)) return json({ status: "forbidden" }, 403);
-			if (!await canvas.allowClientAction(clientIp(request), "http")) return json({ status: "rate_limited" }, 429);
+			if (!await canvas.allowClientAction("http")) return json({ status: "rate_limited" }, 429);
 			if (url.pathname === "/api/canvas/status" && request.method === "GET") return json(await canvas.status());
 			if (url.pathname === "/api/canvas/revisions" && request.method === "GET") return json(await canvas.listRevisions());
 			if (request.method !== "POST") return json({ status: "method_not_allowed" }, 405);
@@ -693,7 +692,7 @@ export default {
 		}
 		const room = await getServerByName<Env, DocumentRoom>(env.DOCUMENT_ROOM, todayRoomName());
 		if (request.method === "POST" && !sameOrigin(request)) return json({ status: "forbidden" }, 403);
-		if (!await room.allowClientAction(clientIp(request), "http")) return json({ status: "rate_limited" }, 429);
+		if (!await room.allowClientAction("http")) return json({ status: "rate_limited" }, 429);
 		if (url.pathname === "/api/status" && request.method === "GET") return json(await room.status());
 		if (url.pathname === "/api/config" && request.method === "GET") return json({ turnstileSiteKey: env.TURNSTILE_SITE_KEY, turnstileAction: TURNSTILE_ACTION });
 		if (url.pathname === "/api/revisions" && request.method === "GET") return json(await room.listRevisions(asOptionalQuery(url.searchParams.get("query")), asRevision(url.searchParams.get("beforeRevision"))));
@@ -703,6 +702,7 @@ export default {
 		const body = await jsonBody(request);
 		if (!body) return json({ status: "invalid_json" }, 400);
 		if (url.pathname === "/api/agent/read") return json(await room.readForSession(String(body.sessionId ?? "")));
+		if (url.pathname === "/api/agent/changes") return json(await room.changesSinceLastRead(String(body.sessionId ?? "")));
 		if (url.pathname === "/api/agent/edit") {
 			const replacements = Array.isArray(body.replacements) ? body.replacements.map(asReplacement).filter((item): item is Replacement => item !== null) : [];
 			return json(await room.editForSession(String(body.sessionId ?? ""), replacements, String(body.operationId ?? ""), "WebMCP agent"));

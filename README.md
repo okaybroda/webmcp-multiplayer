@@ -32,10 +32,11 @@ Open `http://localhost:8787/canvas/` for the visual demo. The app is intentional
 
 The browser creates one opaque `sessionId` per agent bridge. It is never exposed as a tool parameter. The Durable Object records that session's last read revision.
 
-- The first `read_document()` call records the receipt and returns the full document. Later calls in the same session return only the changes since the previous read when there are at most 20. If more than 20 changes arrived, the call returns the full document again; if nothing changed, it returns `up_to_date` without repeating the content.
+- `read_document()` always records the receipt and returns the full current document.
+- `read_changes_since_last_read()` returns the structured changes after that receipt (up to 20), then advances the receipt. It returns `up_to_date` when nothing changed or `reread_required` when the agent needs a new full snapshot.
 - `edit_document({ replacements })` has no `sessionId` or `lastReadRevision` argument. Every replacement supplies its exact `expectedText`; the server rejects the write if that target changed.
-- If at most 20 revisions arrived since the session read, the edit returns `changes_since_read` with line-level old/new text and refreshes its receipt. If the intended edit contradicts those changes, the response tells the agent to escalate to a human instead of overwriting them or making the document inconsistent.
-- If more than 20 revisions arrived, the edit returns `reread_required`; the agent calls `read_document()` again.
+- If revisions arrived since the session read, the edit returns `changes_available` without applying anything. The agent calls `read_changes_since_last_read()` to review line-level old/new text before retrying deliberately.
+- If more than 20 revisions arrived, the changes tool returns `reread_required`; the agent calls `read_document()` again.
 - If a retry no longer finds its `expectedText` at the requested lines, it returns `target_changed` and the agent must read again. This is the server-side conditional-write guard.
 
 Human clients receive Yjs updates live, but their own typing remains a local draft. The editor renders removed text in red and proposed text in green, with an inline checkmark that publishes the draft. If a remote edit arrives first, the checkmark is disabled until the draft is discarded and the live document is reviewed. Approved human edits create the same revision history used by agent freshness checks.
