@@ -1,15 +1,15 @@
 {
-  "name": "canvas-relay-webmcp",
+  "name": "humanagentmultiplayer",
   "version": "0.1.0",
-  "private": false,
+  "private": true,
   "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "vite build && wrangler deploy --dry-run",
     "deploy": "npm run build && wrangler deploy",
-    "dev": "vite build && wrangler dev",
+    "dev": "vite build && wrangler dev --var APP_ENVIRONMENT:development",
     "dev:client": "vite build --watch",
-    "start": "vite build && wrangler dev",
+    "start": "vite build && wrangler dev --var APP_ENVIRONMENT:development",
     "cf-typegen": "wrangler types",
     "typecheck": "tsc --noEmit"
   },

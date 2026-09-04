@@ -2,6 +2,8 @@
 
 HumanAgentMultiplayer is an open-source WebMCP demonstration of **multiple people and their agents collaborating in the same live workspace**. It includes two public daily demos: a shared contract editor and a visual Excalidraw canvas.
 
+The deployed demos are intentionally unauthenticated. Anyone who opens the same demo on the same UTC day joins the same shared room and can read its content, publish changes, and inspect its revision history. Cloudflare Turnstile protects only the document-restore confirmation; it is not authentication or access control. Treat all participant content as untrusted and never enter confidential, personal, or regulated data.
+
 ## What it demonstrates
 
 - People make local drafts and explicitly commit them to the shared state.
@@ -30,7 +32,9 @@ Open `http://localhost:8787/canvas/` for the visual demo. The app is intentional
 
 ## Agent freshness protocol
 
-The browser creates one opaque `sessionId` per agent bridge. It is never exposed as a tool parameter. The Durable Object records that session's last read revision.
+Each page load registers one WebMCP agent bridge with one opaque `sessionId`. It is never exposed as a tool parameter. The Durable Object records that session's last read revision.
+
+Use exactly one agent per browser tab. All WebMCP calls routed through a tab share its single receipt, so connecting multiple agents to one tab would let one agent advance the receipt for another. Open a separate tab for every agent; receipts cannot be transferred between agents, tabs, browsers, or page loads.
 
 - `read_document()` always records the receipt and returns the full current document.
 - `read_changes_since_last_read()` returns the structured changes after that receipt (up to 20), then advances the receipt. It returns `up_to_date` when nothing changed or `reread_required` when the agent needs a new full snapshot.
@@ -57,7 +61,7 @@ Restore requests are invalidated if the live document changes, and pending local
 npm run deploy
 ```
 
-The document room is named `contract-demo-YYYY-MM-DD` in UTC. It is intentionally a public demo; do not use it for confidential documents. Production use needs authentication, authorization, rate limiting, and a durable audit-retention policy.
+The document and canvas rooms are named `contract-demo-YYYY-MM-DD` and `canvas-demo-YYYY-MM-DD` in UTC. They are intentionally public and shared by every visitor for that UTC day. Production use needs authentication, per-room authorization, abuse-resistant rate limiting, tenant isolation, data lifecycle controls, and a durable audit-retention policy.
 
 ## License
 

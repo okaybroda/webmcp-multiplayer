@@ -12,25 +12,33 @@ const MAX_CANVAS_ELEMENT_BYTES = 60_000;
 const MAX_CANVAS_PATCH_BYTES = 16_000;
 const MAX_CANVAS_SCENE_BYTES = 256_000;
 const MAX_JSON_BODY_BYTES = 256_000;
-const MAX_WEBSOCKET_MESSAGE_BYTES = 128_000;
+const MAX_WEBSOCKET_MESSAGE_BYTES = 64_000;
 const RATE_WINDOW_MS = 60_000;
-// These are intentionally shared by all visitors in a public daily demo room.
-// The room's Durable Object serializes access, so its SQLite counters give us a
-// simple global budget without collecting or persisting client IP addresses.
-const MAX_GLOBAL_HTTP_REQUESTS_PER_WINDOW = 300;
-const MAX_GLOBAL_WEBSOCKET_CONNECTIONS_PER_WINDOW = 60;
-const MAX_WEBSOCKET_MESSAGES_PER_WINDOW = 120;
+const MAX_HTTP_REQUESTS_PER_CLIENT_WINDOW = 120;
+const MAX_WEBSOCKET_CONNECTION_ATTEMPTS_PER_CLIENT_WINDOW = 12;
+const MAX_CONCURRENT_WEBSOCKETS = 40;
+const MAX_CONCURRENT_WEBSOCKETS_PER_CLIENT = 4;
+const MAX_WEBSOCKET_MESSAGES_PER_CONNECTION_WINDOW = 120;
+const MAX_WEBSOCKET_BYTES_PER_CONNECTION_WINDOW = 1_000_000;
+const MAX_WEBSOCKET_MESSAGES_PER_ROOM_WINDOW = 1_200;
+const MAX_WEBSOCKET_BYTES_PER_ROOM_WINDOW = 8_000_000;
 const ACTIVITY_RETENTION_MS = 6 * 60 * 60 * 1_000;
+const EXPIRED_ROOM_RETENTION_MS = 48 * 60 * 60 * 1_000;
 const MAX_RETAINED_REVISIONS = 100;
+const MAX_RETAINED_OPERATIONS = 500;
 const TURNSTILE_ACTION = "turnstile-spin-v1";
-const ALLOWED_TURNSTILE_HOSTNAMES = new Set([
-	"webmcp-demo.rakanlabs.com",
-	"localhost",
-	"127.0.0.1",
+const PRODUCTION_HOSTNAME = "webmcp-demo.rakanlabs.com";
+const CANVAS_ELEMENT_TYPES = new Set(["rectangle", "ellipse", "diamond", "arrow", "line", "text"]);
+const CANVAS_COMMON_FIELDS = new Set([
+	"id", "type", "x", "y", "strokeColor", "backgroundColor", "fillStyle", "strokeWidth", "strokeStyle", "roundness", "roughness", "opacity", "width", "height", "angle", "seed", "version", "versionNonce", "index", "isDeleted", "groupIds", "frameId", "boundElements", "updated", "link", "locked",
 ]);
-const CANVAS_PATCH_FIELDS = new Set([
-	"x", "y", "width", "height", "angle", "text", "originalText", "strokeColor", "backgroundColor", "fillStyle", "strokeWidth", "strokeStyle", "roughness", "opacity", "fontSize", "fontFamily", "textAlign", "verticalAlign", "lineHeight", "link", "locked",
-]);
+const CANVAS_TYPE_FIELDS: Record<string, ReadonlySet<string>> = {
+	rectangle: new Set(), ellipse: new Set(), diamond: new Set(),
+	text: new Set(["fontSize", "fontFamily", "text", "textAlign", "verticalAlign", "containerId", "originalText", "autoResize", "lineHeight"]),
+	line: new Set(["points", "lastCommittedPoint", "startBinding", "endBinding", "startArrowhead", "endArrowhead"]),
+	arrow: new Set(["points", "lastCommittedPoint", "startBinding", "endBinding", "startArrowhead", "endArrowhead", "elbowed", "fixedSegments", "startIsSpecial", "endIsSpecial"]),
+};
+const CANVAS_PATCH_FIELDS = new Set([...CANVAS_COMMON_FIELDS, ...Object.values(CANVAS_TYPE_FIELDS).flatMap((fields) => [...fields])]);
 const INITIAL_DOCUMENT = `# Services Agreement
 
 This Services Agreement (the "Agreement") is entered into by the parties below.
@@ -67,7 +75,7 @@ type CanvasMutation =
 	| { action: "update"; patches: Array<{ id: string; patch: Record<string, unknown> }> }
 	| { action: "delete"; ids: string[] };
 type RateLimitRow = { windowStart: number; count: number };
-type SocketState = { actorId: string; windowStart: number; messageCount: number };
+type SocketState = { actorId: string; clientKey: string; windowStart: number; messageCount: number; byteCount: number };
 
 function todayRoomName(now = new Date()): string { return `contract-demo-${now.toISOString().slice(0, 10)}`; }
 function todayCanvasRoomName(now = new Date()): string { return `canvas-demo-${now.toISOString().slice(0, 10)}`; }
@@ -78,25 +86,34 @@ function asRevision(value: unknown): number | null {
 }
 function asOptionalQuery(value: string | null): string { return (value ?? "").trim().slice(0, MAX_HISTORY_QUERY_LENGTH); }
 function snapshotJson(document: Y.Doc): string { return JSON.stringify(Array.from(Y.encodeStateAsUpdate(document))); }
-function sameOrigin(request: Request): boolean {
+function sameOrigin(request: Request, environment: string): boolean {
 	const origin = request.headers.get("Origin");
-	if (origin === "https://webmcp-demo.rakanlabs.com") return true;
-	// Wrangler rewrites requests through the custom-domain host while running
-	// locally, so retain that exact HTTP origin for development only.
+	if (origin === `https://${PRODUCTION_HOSTNAME}`) return true;
+	if (environment !== "development") return false;
+	// Wrangler rewrites localhost traffic to the configured custom-domain host.
 	if (origin === "http://webmcp-demo.rakanlabs.com") return true;
 	if (origin === null) return false;
 	try {
 		const localOrigin = new URL(origin);
-		return localOrigin.protocol === "http:" && (localOrigin.hostname === "localhost" || localOrigin.hostname === "127.0.0.1");
+		return (localOrigin.protocol === "http:" || localOrigin.protocol === "https:")
+			&& (localOrigin.hostname === "localhost" || localOrigin.hostname === "127.0.0.1");
 	} catch { return false; }
 }
+function allowedTurnstileHostname(hostname: string, environment: string): boolean {
+	return hostname === PRODUCTION_HOSTNAME
+		|| (environment === "development" && (hostname === "localhost" || hostname === "127.0.0.1"));
+}
 function messageSize(message: WSMessage): number { return typeof message === "string" ? new TextEncoder().encode(message).byteLength : message.byteLength; }
-function allowWebSocketMessage(connection: Connection): boolean {
+function allowWebSocketMessage(connection: Connection, message: WSMessage): boolean {
 	const now = Date.now();
+	const bytes = messageSize(message);
 	const state = connection.state as SocketState | null;
-	if (!state || state.windowStart <= now - RATE_WINDOW_MS) { connection.setState({ actorId: state?.actorId ?? "viewer", windowStart: now, messageCount: 1 }); return true; }
-	if (state.messageCount >= MAX_WEBSOCKET_MESSAGES_PER_WINDOW) return false;
-	connection.setState({ ...state, messageCount: state.messageCount + 1 });
+	if (!state || state.windowStart <= now - RATE_WINDOW_MS) {
+		connection.setState({ actorId: state?.actorId ?? "viewer", clientKey: state?.clientKey ?? "unknown", windowStart: now, messageCount: 1, byteCount: bytes });
+		return bytes <= MAX_WEBSOCKET_BYTES_PER_CONNECTION_WINDOW;
+	}
+	if (state.messageCount >= MAX_WEBSOCKET_MESSAGES_PER_CONNECTION_WINDOW || state.byteCount + bytes > MAX_WEBSOCKET_BYTES_PER_CONNECTION_WINDOW) return false;
+	connection.setState({ ...state, messageCount: state.messageCount + 1, byteCount: state.byteCount + bytes });
 	return true;
 }
 
@@ -162,23 +179,96 @@ function historyMetadata(row: RevisionRow): Record<string, unknown> {
 	return { revision: row.revision, actor: row.actor, createdAt: row.createdAt, kind: row.kind, sourceRevision: row.sourceRevision, preview: row.content.slice(0, 260) };
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
+function finiteNumber(value: unknown, minimum: number, maximum: number): value is number { return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum; }
+function boundedInteger(value: unknown, minimum: number, maximum: number): value is number { return Number.isSafeInteger(value) && Number(value) >= minimum && Number(value) <= maximum; }
+function canvasPoint(value: unknown): boolean { return Array.isArray(value) && value.length === 2 && value.every((coordinate) => finiteNumber(coordinate, -1_000_000, 1_000_000)); }
+function canvasBinding(value: unknown): boolean {
+	if (value === null) return true;
+	if (!isRecord(value) || Object.keys(value).some((key) => !["elementId", "focus", "gap", "fixedPoint"].includes(key))) return false;
+	return safeId(value.elementId) !== null && finiteNumber(value.focus, -1, 1) && finiteNumber(value.gap, 0, 1_000_000) && (value.fixedPoint === undefined || canvasPoint(value.fixedPoint));
+}
+function canvasRoundness(value: unknown): boolean {
+	if (value === null) return true;
+	return isRecord(value) && Object.keys(value).every((key) => key === "type" || key === "value")
+		&& boundedInteger(value.type, 1, 3) && (value.value === undefined || finiteNumber(value.value, 0, 1_000_000));
+}
+function canvasBoundElements(value: unknown): boolean {
+	return value === null || (Array.isArray(value) && value.length <= 20 && value.every((item) => isRecord(item)
+		&& Object.keys(item).length === 2 && safeId(item.id) !== null && (item.type === "arrow" || item.type === "text")));
+}
+function canvasFixedSegments(value: unknown): boolean {
+	return value === null || (Array.isArray(value) && value.length <= 200 && value.every((segment) => isRecord(segment)
+		&& Object.keys(segment).every((key) => key === "start" || key === "end" || key === "index")
+		&& canvasPoint(segment.start) && canvasPoint(segment.end) && boundedInteger(segment.index, 0, 200)));
+}
+function safeCanvasLink(value: unknown): boolean {
+	if (value === null) return true;
+	if (typeof value !== "string" || value.length > 2_048) return false;
+	try {
+		const url = new URL(value);
+		return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password;
+	} catch { return false; }
+}
+function validCanvasField(key: string, value: unknown): boolean {
+	switch (key) {
+		case "id": return safeId(value) !== null;
+		case "type": return typeof value === "string" && CANVAS_ELEMENT_TYPES.has(value);
+		case "x": case "y": return finiteNumber(value, -1_000_000, 1_000_000);
+		case "width": case "height": return finiteNumber(value, 0, 1_000_000);
+		case "angle": return finiteNumber(value, -100, 100);
+		case "strokeColor": case "backgroundColor": return typeof value === "string" && (/^#[0-9a-fA-F]{3,8}$/.test(value) || value === "transparent");
+		case "fillStyle": return value === "hachure" || value === "cross-hatch" || value === "solid" || value === "zigzag";
+		case "strokeWidth": return finiteNumber(value, 0, 20);
+		case "strokeStyle": return value === "solid" || value === "dashed" || value === "dotted";
+		case "roundness": return canvasRoundness(value);
+		case "roughness": return boundedInteger(value, 0, 2);
+		case "opacity": return boundedInteger(value, 0, 100);
+		case "seed": case "version": case "versionNonce": return boundedInteger(value, 0, 2_147_483_647);
+		case "index": return value === null || (typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value));
+		case "isDeleted": return value === false;
+		case "groupIds": return Array.isArray(value) && value.length <= 10 && value.every((id) => safeId(id) !== null);
+		case "frameId": return value === null;
+		case "boundElements": return canvasBoundElements(value);
+		case "updated": return boundedInteger(value, 0, Number.MAX_SAFE_INTEGER);
+		case "link": return safeCanvasLink(value);
+		case "locked": case "autoResize": case "elbowed": return typeof value === "boolean";
+		case "text": case "originalText": return typeof value === "string" && value.length <= 10_000;
+		case "fontSize": return finiteNumber(value, 1, 512);
+		case "fontFamily": return typeof value === "number" && [1, 2, 3, 5, 6, 7, 8, 9].includes(value);
+		case "textAlign": return value === "left" || value === "center" || value === "right";
+		case "verticalAlign": return value === "top" || value === "middle" || value === "bottom";
+		case "containerId": return value === null || safeId(value) !== null;
+		case "lineHeight": return finiteNumber(value, 0.5, 5);
+		case "points": return Array.isArray(value) && value.length >= 2 && value.length <= 200 && value.every(canvasPoint);
+		case "lastCommittedPoint": return value === null || canvasPoint(value);
+		case "startBinding": case "endBinding": return canvasBinding(value);
+		case "startArrowhead": case "endArrowhead": return value === null || (typeof value === "string" && ["arrow", "bar", "dot", "circle", "circle_outline", "triangle", "triangle_outline", "diamond", "diamond_outline", "crowfoot_one", "crowfoot_many", "crowfoot_one_or_many"].includes(value));
+		case "fixedSegments": return canvasFixedSegments(value);
+		case "startIsSpecial": case "endIsSpecial": return value === null || typeof value === "boolean";
+		default: return false;
+	}
+}
 function canvasElement(value: unknown): CanvasElement | null {
-	if (!isRecord(value) || !safeId(value.id) || typeof value.type !== "string" || value.type.length === 0 || value.type.length > 40) return null;
+	if (!isRecord(value) || !safeId(value.id) || typeof value.type !== "string" || !CANVAS_ELEMENT_TYPES.has(value.type)) return null;
+	const allowedFields = new Set([...CANVAS_COMMON_FIELDS, ...CANVAS_TYPE_FIELDS[value.type]]);
+	if (Object.keys(value).some((key) => !allowedFields.has(key) || !validCanvasField(key, value[key]))) return null;
+	if (!["x", "y", "width", "height"].every((key) => Object.hasOwn(value, key))) return null;
+	if (value.type === "text" && !["text", "originalText", "fontSize", "fontFamily", "lineHeight"].every((key) => Object.hasOwn(value, key))) return null;
+	if ((value.type === "line" || value.type === "arrow") && !Object.hasOwn(value, "points")) return null;
 	try {
 		const copy = JSON.parse(JSON.stringify(value)) as CanvasElement;
-		const serialized = JSON.stringify(copy);
-		return serialized.length <= MAX_CANVAS_ELEMENT_BYTES ? copy : null;
+		return new TextEncoder().encode(JSON.stringify(copy)).byteLength <= MAX_CANVAS_ELEMENT_BYTES ? copy : null;
 	} catch { return null; }
 }
 function canvasPatch(value: unknown): Record<string, unknown> | null {
-	if (!isRecord(value) || Object.keys(value).some((key) => !CANVAS_PATCH_FIELDS.has(key))) return null;
-	try { return JSON.stringify(value).length <= MAX_CANVAS_PATCH_BYTES ? JSON.parse(JSON.stringify(value)) as Record<string, unknown> : null; } catch { return null; }
+	if (!isRecord(value) || Object.keys(value).length === 0 || Object.keys(value).some((key) => key === "id" || key === "type" || !CANVAS_PATCH_FIELDS.has(key) || !validCanvasField(key, value[key]))) return null;
+	try { return new TextEncoder().encode(JSON.stringify(value)).byteLength <= MAX_CANVAS_PATCH_BYTES ? JSON.parse(JSON.stringify(value)) as Record<string, unknown> : null; } catch { return null; }
 }
 function canvasScene(value: unknown): CanvasElement[] | null {
 	if (!Array.isArray(value) || value.length > MAX_CANVAS_ELEMENTS) return null;
 	const elements = value.map(canvasElement);
 	if (!elements.every((element): element is CanvasElement => element !== null) || new Set(elements.map((element) => element.id)).size !== elements.length) return null;
-	try { return JSON.stringify(elements).length <= MAX_CANVAS_SCENE_BYTES ? elements : null; } catch { return null; }
+	try { return new TextEncoder().encode(JSON.stringify(elements)).byteLength <= MAX_CANVAS_SCENE_BYTES ? elements : null; } catch { return null; }
 }
 function canvasMutation(value: unknown): CanvasMutation | null {
 	if (!isRecord(value) || typeof value.action !== "string") return null;
@@ -199,6 +289,30 @@ function canvasMutation(value: unknown): CanvasMutation | null {
 		return ids.length === value.ids.length && ids.length > 0 && ids.length <= 40 ? { action: "delete", ids } : null;
 	}
 	return null;
+}
+function websocketMessageType(message: WSMessage): number | null {
+	if (typeof message === "string") return null;
+	const bytes = message instanceof Uint8Array
+		? message
+		: message instanceof ArrayBuffer
+			? new Uint8Array(message)
+			: new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+	return bytes.byteLength > 0 ? bytes[0] : null;
+}
+function connectionClientKey(connection: Connection): string { return (connection.state as SocketState | null)?.clientKey ?? "unknown"; }
+function requestClientKey(request: Request): string { const value = request.headers.get("X-WebMCP-Client-Key"); return value && /^[0-9a-f]{32}$/.test(value) ? value : "unknown"; }
+async function anonymousClientKey(request: Request): Promise<string> {
+	const url = new URL(request.url);
+	const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+	const source = local ? `local:${url.origin}` : `cf:${request.headers.get("CF-Connecting-IP") ?? "unknown"}`;
+	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source)));
+	return [...digest.slice(0, 16)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function roomExpiryAt(name: string, prefix: string): number {
+	const match = name.match(new RegExp(`^${prefix}(\\d{4}-\\d{2}-\\d{2})$`));
+	if (!match) return Date.now() + EXPIRED_ROOM_RETENTION_MS;
+	const start = Date.parse(`${match[1]}T00:00:00.000Z`);
+	return Number.isFinite(start) ? start + EXPIRED_ROOM_RETENTION_MS : Date.now() + EXPIRED_ROOM_RETENTION_MS;
 }
 
 export class DocumentRoom extends YServer {
@@ -245,22 +359,47 @@ export class DocumentRoom extends YServer {
 		this.lastText = this.document.getText("content").toString();
 		this.ensureHistoryBaseline();
 		this.document.getText("content").observe((event) => this.recordTextChange(event.transaction.origin));
+		await this.ctx.storage.setAlarm(Math.max(Date.now() + 60_000, roomExpiryAt(this.name, "contract-demo-")));
 	}
 	async onSave(): Promise<void> { this.persistSnapshot(); }
 	onConnect(connection: Connection, context: { request: Request }): void {
-		connection.setState({ actorId: "viewer", windowStart: Date.now(), messageCount: 0 });
+		const clientKey = requestClientKey(context.request);
+		const connections = [...this.getConnections()];
+		if (connections.length > MAX_CONCURRENT_WEBSOCKETS || connections.filter((candidate) => connectionClientKey(candidate) === clientKey).length >= MAX_CONCURRENT_WEBSOCKETS_PER_CLIENT) {
+			connection.close(1008, "WebSocket connection limit exceeded");
+			return;
+		}
+		connection.setState({ actorId: "viewer", clientKey, windowStart: Date.now(), messageCount: 0, byteCount: 0 });
 		super.onConnect(connection, context);
 	}
 	isReadOnly(): boolean { return true; }
 	onMessage(connection: Connection, message: WSMessage): void {
 		if (messageSize(message) > MAX_WEBSOCKET_MESSAGE_BYTES) { connection.close(1009, "WebSocket message too large"); return; }
-		if (!allowWebSocketMessage(connection)) { connection.close(1008, "WebSocket message rate exceeded"); return; }
+		if (!allowWebSocketMessage(connection, message)) { connection.close(1008, "WebSocket message rate exceeded"); return; }
+		// This demo does not expose presence/cursor state. Only Yjs sync messages
+		// are accepted, and isReadOnly() prevents clients from writing updates.
+		if (websocketMessageType(message) !== 0) return;
+		if (!this.consumeSocketBudget(messageSize(message))) { connection.close(1008, "Room WebSocket budget exceeded"); return; }
 		super.onMessage(connection, message);
 	}
-	async allowClientAction(kind: "http" | "websocket"): Promise<boolean> {
+	async allowHttpAction(clientKey: string): Promise<boolean> {
 		if (!this.started) await this.onStart();
-		const limit = kind === "http" ? MAX_GLOBAL_HTTP_REQUESTS_PER_WINDOW : MAX_GLOBAL_WEBSOCKET_CONNECTIONS_PER_WINDOW;
-		return this.consumeRateLimit(kind, limit);
+		return this.consumeRateLimit(`http:${clientKey}`, MAX_HTTP_REQUESTS_PER_CLIENT_WINDOW);
+	}
+	async allowWebSocketConnection(clientKey: string): Promise<boolean> {
+		if (!this.started) await this.onStart();
+		const connections = [...this.getConnections()];
+		if (connections.length >= MAX_CONCURRENT_WEBSOCKETS || connections.filter((connection) => connectionClientKey(connection) === clientKey).length >= MAX_CONCURRENT_WEBSOCKETS_PER_CLIENT) return false;
+		return this.consumeRateLimit(`ws-connect:${clientKey}`, MAX_WEBSOCKET_CONNECTION_ATTEMPTS_PER_CLIENT_WINDOW);
+	}
+	async onAlarm(): Promise<void> {
+		if (Date.now() >= roomExpiryAt(this.name, "contract-demo-")) {
+			for (const connection of this.getConnections()) connection.close(1008, "This demo room has expired.");
+			await this.ctx.storage.deleteAll();
+			return;
+		}
+		this.pruneActivity(Date.now());
+		await this.ctx.storage.setAlarm(roomExpiryAt(this.name, "contract-demo-"));
 	}
 
 	async readForSession(sessionId: string): Promise<OperationResult> {
@@ -275,6 +414,7 @@ export class DocumentRoom extends YServer {
 		if (receipt.revision === this.revision) { this.recordRead(sessionId); return { status: "up_to_date", revision: this.revision }; }
 		const rows = Array.from(this.ctx.storage.sql.exec<StoredChange>("SELECT revision, actor, start_line as startLine, end_line as endLine, old_text as oldText, new_text as newText, truncated, created_at as createdAt FROM changes WHERE revision > ? ORDER BY revision ASC LIMIT ?", receipt.revision, MAX_DELIVERED_CHANGES + 1));
 		if (rows.length > MAX_DELIVERED_CHANGES) return { status: "reread_required", currentRevision: this.revision, message: "More than 20 changes arrived. Call read_document for the current document." };
+		if (rows.some((change) => Boolean(change.truncated))) return { status: "reread_required", currentRevision: this.revision, message: "A change was too large to summarize safely. Call read_document for the current document." };
 		this.recordRead(sessionId);
 		return { status: "changes_since_read", fromRevision: receipt.revision, currentRevision: this.revision, changes: rows.map((change) => ({ ...change, truncated: Boolean(change.truncated) })) };
 	}
@@ -289,6 +429,7 @@ export class DocumentRoom extends YServer {
 		if (receipt.revision < this.revision) {
 			const rows = Array.from(this.ctx.storage.sql.exec<StoredChange>("SELECT revision, actor, start_line as startLine, end_line as endLine, old_text as oldText, new_text as newText, truncated, created_at as createdAt FROM changes WHERE revision > ? ORDER BY revision ASC LIMIT ?", receipt.revision, MAX_DELIVERED_CHANGES + 1));
 			if (rows.length > MAX_DELIVERED_CHANGES) return this.storeOperation(operationId, { status: "reread_required", currentRevision: this.revision, message: "More than 20 changes arrived since this agent last read the document. Call read_document again." });
+			if (rows.some((change) => Boolean(change.truncated))) return this.storeOperation(operationId, { status: "reread_required", currentRevision: this.revision, message: "A change was too large to summarize safely. Call read_document again." });
 			return this.storeOperation(operationId, { status: "changes_available", currentRevision: this.revision, message: "The document changed since your last read. Call read_changes_since_last_read before retrying this edit." });
 		}
 		const current = this.document.getText("content").toString();
@@ -409,10 +550,24 @@ export class DocumentRoom extends YServer {
 		this.ctx.storage.sql.exec("UPDATE request_limits SET count = count + 1 WHERE key = ?", key);
 		return true;
 	}
+	private consumeSocketBudget(bytes: number): boolean {
+		const now = Date.now();
+		const messageRow = Array.from(this.ctx.storage.sql.exec<RateLimitRow>("SELECT window_start as windowStart, count FROM request_limits WHERE key = 'ws-room-messages'"))[0];
+		const byteRow = Array.from(this.ctx.storage.sql.exec<RateLimitRow>("SELECT window_start as windowStart, count FROM request_limits WHERE key = 'ws-room-bytes'"))[0];
+		const messages = !messageRow || messageRow.windowStart <= now - RATE_WINDOW_MS ? 0 : messageRow.count;
+		const byteCount = !byteRow || byteRow.windowStart <= now - RATE_WINDOW_MS ? 0 : byteRow.count;
+		if (messages >= MAX_WEBSOCKET_MESSAGES_PER_ROOM_WINDOW || byteCount + bytes > MAX_WEBSOCKET_BYTES_PER_ROOM_WINDOW) return false;
+		this.ctx.storage.transactionSync(() => {
+			this.ctx.storage.sql.exec("INSERT INTO request_limits (key, window_start, count) VALUES ('ws-room-messages', ?, 1) ON CONFLICT(key) DO UPDATE SET window_start = ?, count = ?", messages === 0 ? now : messageRow!.windowStart, messages === 0 ? now : messageRow!.windowStart, messages + 1);
+			this.ctx.storage.sql.exec("INSERT INTO request_limits (key, window_start, count) VALUES ('ws-room-bytes', ?, ?) ON CONFLICT(key) DO UPDATE SET window_start = ?, count = ?", byteCount === 0 ? now : byteRow!.windowStart, bytes, byteCount === 0 ? now : byteRow!.windowStart, byteCount + bytes);
+		});
+		return true;
+	}
 	private pruneActivity(now: number): void {
 		const oldest = Math.max(0, this.revision - MAX_RETAINED_REVISIONS);
 		this.ctx.storage.sql.exec("DELETE FROM read_receipts WHERE updated_at < ?", now - ACTIVITY_RETENTION_MS);
 		this.ctx.storage.sql.exec("DELETE FROM operations WHERE created_at < ?", now - ACTIVITY_RETENTION_MS);
+		this.ctx.storage.sql.exec("DELETE FROM operations WHERE operation_id NOT IN (SELECT operation_id FROM operations ORDER BY created_at DESC LIMIT ?)", MAX_RETAINED_OPERATIONS);
 		this.ctx.storage.sql.exec("DELETE FROM restore_intents WHERE created_at < ?", now - ACTIVITY_RETENTION_MS);
 		this.ctx.storage.sql.exec("DELETE FROM changes WHERE revision < ?", oldest);
 		this.ctx.storage.sql.exec("DELETE FROM revision_snapshots WHERE revision < ?", oldest);
@@ -450,24 +605,56 @@ export class CanvasRoom extends YServer {
 		const snapshot = Array.from(this.ctx.storage.sql.exec<{ snapshotJson: string }>("SELECT snapshot_json as snapshotJson FROM canvas_snapshots WHERE id = 1"))[0];
 		if (snapshot) Y.applyUpdate(this.document, new Uint8Array(JSON.parse(snapshot.snapshotJson)));
 		this.elements = this.document.getMap<CanvasElement>("elements");
-		if (this.elements.size === 0) { this.seedCanvas(); this.persistSnapshot(); }
+		let sanitizedLegacyContent = false;
+		this.document.transact(() => {
+			for (const [id, element] of this.elements) {
+				const safeElement = canvasElement(element);
+				if (!safeElement) { this.elements.delete(id); sanitizedLegacyContent = true; continue; }
+				if (JSON.stringify(safeElement) !== JSON.stringify(element)) { this.elements.set(id, safeElement); sanitizedLegacyContent = true; }
+			}
+		}, { actorId: "system", action: "security_sanitize" });
+		if (this.elements.size === 0) { this.seedCanvas(); sanitizedLegacyContent = true; }
+		if (sanitizedLegacyContent) this.persistSnapshot();
 		this.elements.observe((event) => this.recordCanvasChange(event));
 		this.loaded = true;
+		await this.ctx.storage.setAlarm(Math.max(Date.now() + 60_000, roomExpiryAt(this.name, "canvas-demo-")));
 	}
 	onConnect(connection: Connection, context: { request: Request }): void {
-		connection.setState({ actorId: "viewer", windowStart: Date.now(), messageCount: 0 });
+		const clientKey = requestClientKey(context.request);
+		const connections = [...this.getConnections()];
+		if (connections.length > MAX_CONCURRENT_WEBSOCKETS || connections.filter((candidate) => connectionClientKey(candidate) === clientKey).length >= MAX_CONCURRENT_WEBSOCKETS_PER_CLIENT) {
+			connection.close(1008, "WebSocket connection limit exceeded");
+			return;
+		}
+		connection.setState({ actorId: "viewer", clientKey, windowStart: Date.now(), messageCount: 0, byteCount: 0 });
 		super.onConnect(connection, context);
 	}
 	isReadOnly(): boolean { return true; }
 	onMessage(connection: Connection, message: WSMessage): void {
 		if (messageSize(message) > MAX_WEBSOCKET_MESSAGE_BYTES) { connection.close(1009, "WebSocket message too large"); return; }
-		if (!allowWebSocketMessage(connection)) { connection.close(1008, "WebSocket message rate exceeded"); return; }
+		if (!allowWebSocketMessage(connection, message)) { connection.close(1008, "WebSocket message rate exceeded"); return; }
+		if (websocketMessageType(message) !== 0) return;
+		if (!this.consumeSocketBudget(messageSize(message))) { connection.close(1008, "Room WebSocket budget exceeded"); return; }
 		super.onMessage(connection, message);
 	}
-	async allowClientAction(kind: "http" | "websocket"): Promise<boolean> {
+	async allowHttpAction(clientKey: string): Promise<boolean> {
 		await this.ensureLoaded();
-		const limit = kind === "http" ? MAX_GLOBAL_HTTP_REQUESTS_PER_WINDOW : MAX_GLOBAL_WEBSOCKET_CONNECTIONS_PER_WINDOW;
-		return this.consumeRateLimit(kind, limit);
+		return this.consumeRateLimit(`http:${clientKey}`, MAX_HTTP_REQUESTS_PER_CLIENT_WINDOW);
+	}
+	async allowWebSocketConnection(clientKey: string): Promise<boolean> {
+		await this.ensureLoaded();
+		const connections = [...this.getConnections()];
+		if (connections.length >= MAX_CONCURRENT_WEBSOCKETS || connections.filter((connection) => connectionClientKey(connection) === clientKey).length >= MAX_CONCURRENT_WEBSOCKETS_PER_CLIENT) return false;
+		return this.consumeRateLimit(`ws-connect:${clientKey}`, MAX_WEBSOCKET_CONNECTION_ATTEMPTS_PER_CLIENT_WINDOW);
+	}
+	async onAlarm(): Promise<void> {
+		if (Date.now() >= roomExpiryAt(this.name, "canvas-demo-")) {
+			for (const connection of this.getConnections()) connection.close(1008, "This demo canvas has expired.");
+			await this.ctx.storage.deleteAll();
+			return;
+		}
+		this.pruneActivity(Date.now());
+		await this.ctx.storage.setAlarm(roomExpiryAt(this.name, "canvas-demo-"));
 	}
 
 	async readForSession(sessionId: string): Promise<OperationResult> {
@@ -495,16 +682,17 @@ export class CanvasRoom extends YServer {
 		const prior = Array.from(this.ctx.storage.sql.exec<{ resultJson: string }>("SELECT result_json as resultJson FROM canvas_operations WHERE operation_id = ?", operationId))[0];
 		if (prior) return JSON.parse(prior.resultJson) as OperationResult;
 		const receipt = this.receipt(sessionId);
-		if (!receipt) return this.storeOperation(operationId, { status: "read_required", message: "Call read_canvas before making a change." });
+		if (!receipt) return { status: "read_required", message: "Call read_canvas before making a change." };
 		if (receipt.revision < this.revision) {
 			const changes = this.changesSince(receipt.revision);
-			return this.storeOperation(operationId, changes.length <= MAX_DELIVERED_CHANGES
+			return changes.length <= MAX_DELIVERED_CHANGES
 				? { status: "changes_since_read", currentRevision: this.revision, changes, elements: this.sceneElements(), message: "The canvas changed since this agent last read it. Call read_canvas to record the refreshed scene before retrying." }
-				: { status: "reread_required", currentRevision: this.revision, message: "More than 20 canvas changes arrived. Call read_canvas again before retrying." });
+				: { status: "reread_required", currentRevision: this.revision, message: "More than 20 canvas changes arrived. Call read_canvas again before retrying." };
 		}
-		const changedIds = this.applyMutation(operation, actorLabel);
+		const applied = this.applyMutation(operation, actorLabel);
+		if (applied.status !== "ok") return { status: "invalid_mutation" };
 		this.recordRead(sessionId);
-		return this.storeOperation(operationId, { status: changedIds.length ? "applied" : "no_change", revision: this.revision, changedElementIds: changedIds });
+		return this.storeOperation(operationId, { status: applied.changedIds.length ? "applied" : "no_change", revision: this.revision, changedElementIds: applied.changedIds });
 	}
 	async commitHumanScene(expectedRevision: number, scene: CanvasElement[]): Promise<OperationResult> {
 		await this.ensureLoaded();
@@ -519,7 +707,7 @@ export class CanvasRoom extends YServer {
 			for (const [id, element] of next) {
 				const current = this.elements.get(id);
 				if (JSON.stringify(current) === JSON.stringify(element)) continue;
-				this.elements.set(id, current ? { ...current, ...element, id, type: current.type, version: (Number(current.version) || 0) + 1, updated: Date.now() } : { ...element, version: Number(element.version) || 1, updated: Date.now(), isDeleted: false });
+				this.elements.set(id, current ? { ...element, id, type: current.type, version: (Number(current.version) || 0) + 1, updated: Date.now() } : { ...element, version: Number(element.version) || 1, updated: Date.now(), isDeleted: false });
 				changed.add(id);
 			}
 		}, { actorId: "human", action: "human_commit" });
@@ -535,14 +723,24 @@ export class CanvasRoom extends YServer {
 
 	private seedCanvas(): void {
 		const seed = [
-			{ id: "canvas-title-00001", type: "text", x: 120, y: 100, text: "Design a great first-run experience", fontSize: 28, fontFamily: 1, textAlign: "left", verticalAlign: "top", containerId: null, originalText: "Design a great first-run experience", autoResize: true, lineHeight: 1.25, strokeColor: "#1e1e1e", backgroundColor: "transparent", fillStyle: "solid", strokeWidth: 1, strokeStyle: "solid", roughness: 1, opacity: 100, angle: 0, seed: 1, version: 1, versionNonce: 1, isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false },
+			{ id: "canvas-title-00001", type: "text", x: 120, y: 100, width: 430, height: 35, text: "Design a great first-run experience", fontSize: 28, fontFamily: 1, textAlign: "left", verticalAlign: "top", containerId: null, originalText: "Design a great first-run experience", autoResize: true, lineHeight: 1.25, strokeColor: "#1e1e1e", backgroundColor: "transparent", fillStyle: "solid", strokeWidth: 1, strokeStyle: "solid", roughness: 1, opacity: 100, angle: 0, seed: 1, version: 1, versionNonce: 1, isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false },
 			{ id: "canvas-card-000001", type: "rectangle", x: 120, y: 180, width: 280, height: 150, strokeColor: "#4f46e5", backgroundColor: "#eef2ff", fillStyle: "solid", strokeWidth: 2, strokeStyle: "solid", roughness: 1, opacity: 100, angle: 0, seed: 2, version: 1, versionNonce: 2, isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false },
-			{ id: "canvas-note-000001", type: "text", x: 160, y: 225, text: "Human sketch\n\nInvite agents to add\noptions, flows, and copy.", fontSize: 20, fontFamily: 1, textAlign: "left", verticalAlign: "top", containerId: null, originalText: "Human sketch\n\nInvite agents to add\noptions, flows, and copy.", autoResize: true, lineHeight: 1.25, strokeColor: "#312e81", backgroundColor: "transparent", fillStyle: "solid", strokeWidth: 1, strokeStyle: "solid", roughness: 1, opacity: 100, angle: 0, seed: 3, version: 1, versionNonce: 3, isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false },
+			{ id: "canvas-note-000001", type: "text", x: 160, y: 225, width: 220, height: 100, text: "Human sketch\n\nInvite agents to add\noptions, flows, and copy.", fontSize: 20, fontFamily: 1, textAlign: "left", verticalAlign: "top", containerId: null, originalText: "Human sketch\n\nInvite agents to add\noptions, flows, and copy.", autoResize: true, lineHeight: 1.25, strokeColor: "#312e81", backgroundColor: "transparent", fillStyle: "solid", strokeWidth: 1, strokeStyle: "solid", roughness: 1, opacity: 100, angle: 0, seed: 3, version: 1, versionNonce: 3, isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false },
 		] as CanvasElement[];
 		this.document.transact(() => seed.forEach((element) => this.elements.set(element.id, element)), { actorId: "system", action: "seed" });
 	}
-	private applyMutation(operation: CanvasMutation, actorLabel: string): string[] {
+	private applyMutation(operation: CanvasMutation, actorLabel: string): { status: "ok"; changedIds: string[] } | { status: "invalid_mutation" } {
 		const changed = new Set<string>();
+		const preparedUpdates = new Map<string, CanvasElement>();
+		if (operation.action === "update") {
+			for (const { id, patch } of operation.patches) {
+				const current = this.elements.get(id);
+				if (!current) continue;
+				const next = canvasElement({ ...current, ...patch, id, type: current.type, version: (Number(current.version) || 0) + 1, updated: Date.now() });
+				if (!next) return { status: "invalid_mutation" };
+				preparedUpdates.set(id, next);
+			}
+		}
 		this.document.transact(() => {
 			if (operation.action === "create") {
 				for (const element of operation.elements) {
@@ -552,12 +750,9 @@ export class CanvasRoom extends YServer {
 				}
 			}
 			if (operation.action === "update") {
-				for (const { id, patch } of operation.patches) {
-					const current = this.elements.get(id);
-					if (!current) continue;
-					const { id: _id, type: _type, ...safePatch } = patch;
-					const next = canvasElement({ ...current, ...safePatch, id, type: current.type, version: (Number(current.version) || 0) + 1, updated: Date.now() });
-					if (next) { this.elements.set(id, next); changed.add(id); }
+				for (const [id, next] of preparedUpdates) {
+					this.elements.set(id, next);
+					changed.add(id);
 				}
 			}
 			if (operation.action === "delete") for (const id of operation.ids) {
@@ -566,7 +761,7 @@ export class CanvasRoom extends YServer {
 				changed.add(id);
 			}
 		}, { actorId: actorLabel, action: operation.action });
-		return [...changed];
+		return { status: "ok", changedIds: [...changed] };
 	}
 	private recordCanvasChange(event: Y.YMapEvent<CanvasElement>): void {
 		if (event.keys.size === 0) return;
@@ -600,10 +795,24 @@ export class CanvasRoom extends YServer {
 		this.ctx.storage.sql.exec("UPDATE request_limits SET count = count + 1 WHERE key = ?", key);
 		return true;
 	}
+	private consumeSocketBudget(bytes: number): boolean {
+		const now = Date.now();
+		const messageRow = Array.from(this.ctx.storage.sql.exec<RateLimitRow>("SELECT window_start as windowStart, count FROM request_limits WHERE key = 'ws-room-messages'"))[0];
+		const byteRow = Array.from(this.ctx.storage.sql.exec<RateLimitRow>("SELECT window_start as windowStart, count FROM request_limits WHERE key = 'ws-room-bytes'"))[0];
+		const messages = !messageRow || messageRow.windowStart <= now - RATE_WINDOW_MS ? 0 : messageRow.count;
+		const byteCount = !byteRow || byteRow.windowStart <= now - RATE_WINDOW_MS ? 0 : byteRow.count;
+		if (messages >= MAX_WEBSOCKET_MESSAGES_PER_ROOM_WINDOW || byteCount + bytes > MAX_WEBSOCKET_BYTES_PER_ROOM_WINDOW) return false;
+		this.ctx.storage.transactionSync(() => {
+			this.ctx.storage.sql.exec("INSERT INTO request_limits (key, window_start, count) VALUES ('ws-room-messages', ?, 1) ON CONFLICT(key) DO UPDATE SET window_start = ?, count = ?", messages === 0 ? now : messageRow!.windowStart, messages === 0 ? now : messageRow!.windowStart, messages + 1);
+			this.ctx.storage.sql.exec("INSERT INTO request_limits (key, window_start, count) VALUES ('ws-room-bytes', ?, ?) ON CONFLICT(key) DO UPDATE SET window_start = ?, count = ?", byteCount === 0 ? now : byteRow!.windowStart, bytes, byteCount === 0 ? now : byteRow!.windowStart, byteCount + bytes);
+		});
+		return true;
+	}
 	private pruneActivity(now: number): void {
 		const oldest = Math.max(0, this.revision - MAX_RETAINED_REVISIONS);
 		this.ctx.storage.sql.exec("DELETE FROM canvas_read_receipts WHERE updated_at < ?", now - ACTIVITY_RETENTION_MS);
 		this.ctx.storage.sql.exec("DELETE FROM canvas_operations WHERE created_at < ?", now - ACTIVITY_RETENTION_MS);
+		this.ctx.storage.sql.exec("DELETE FROM canvas_operations WHERE operation_id NOT IN (SELECT operation_id FROM canvas_operations ORDER BY created_at DESC LIMIT ?)", MAX_RETAINED_OPERATIONS);
 		this.ctx.storage.sql.exec("DELETE FROM canvas_changes WHERE revision < ?", oldest);
 		this.ctx.storage.sql.exec("DELETE FROM request_limits WHERE window_start < ?", now - RATE_WINDOW_MS * 2);
 	}
@@ -631,7 +840,25 @@ async function jsonBody(request: Request): Promise<Record<string, unknown> | nul
 		return body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : null;
 	} catch { return null; }
 }
-function json(result: unknown, status = 200): Response { return Response.json(result, { status, headers: { "Cache-Control": "no-store" } }); }
+const SECURITY_HEADERS: Readonly<Record<string, string>> = {
+	"Content-Security-Policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://challenges.cloudflare.com wss://webmcp-demo.rakanlabs.com ws://localhost:* ws://127.0.0.1:*; frame-src https://challenges.cloudflare.com",
+	"Cross-Origin-Opener-Policy": "same-origin",
+	"Cross-Origin-Resource-Policy": "same-origin",
+	"Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+	"Referrer-Policy": "same-origin",
+	"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+	"X-Content-Type-Options": "nosniff",
+	"X-Frame-Options": "DENY",
+};
+function secureResponse(response: Response): Response {
+	const headers = new Headers(response.headers);
+	for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
+	return new Response(response.body, { status: response.status, statusText: response.statusText, headers, webSocket: response.webSocket });
+}
+function json(result: unknown, status = 200): Response { return secureResponse(Response.json(result, { status, headers: { "Cache-Control": "no-store" } })); }
+function plain(message: string, status: number, headers?: HeadersInit): Response { return secureResponse(new Response(message, { status, headers })); }
+function methodNotAllowed(allowed: string): Response { return plain("Method not allowed", 405, { Allow: allowed }); }
+function isJsonRequest(request: Request): boolean { return request.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() === "application/json"; }
 function isCurrentDocumentRoomRequest(url: URL): boolean {
 	const parts = url.pathname.split("/");
 	return parts.length === 4 && parts[1] === "parties" && parts[2].toLowerCase() === "document-room" && parts[3] === todayRoomName();
@@ -648,7 +875,7 @@ async function verifyRestoreToken(env: Env, token: unknown, request: Request, in
 			body: JSON.stringify({ token, remoteip: request.headers.get("CF-Connecting-IP") ?? undefined, idempotency_key: intentId }),
 		});
 		const result = await response.json() as { success?: unknown; hostname?: unknown; action?: unknown };
-		if (result.success === true && typeof result.hostname === "string" && ALLOWED_TURNSTILE_HOSTNAMES.has(result.hostname) && result.action === TURNSTILE_ACTION) return { status: "ok" };
+		if (result.success === true && typeof result.hostname === "string" && allowedTurnstileHostname(result.hostname, env.APP_ENVIRONMENT) && result.action === TURNSTILE_ACTION) return { status: "ok" };
 	} catch { /* Treat verification outages as a failed confirmation without exposing service internals. */ }
 	return { status: "turnstile_failed", message: "Confirmation could not be verified. Please try the challenge again." };
 }
@@ -657,78 +884,115 @@ export default {
 	async fetch(request, env): Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname.startsWith("/parties/")) {
-			// Do this before PartyServer resolves a Durable Object: otherwise a
-			// public visitor can create arbitrary named rooms just by opening a URL.
-			if (!isCurrentDocumentRoomRequest(url) && !isCurrentCanvasRoomRequest(url)) return new Response("Room not found", { status: 404 });
-			if (!sameOrigin(request)) return new Response("Forbidden", { status: 403 });
+			// Fully validate the route and handshake before either PartyServer or
+			// this handler resolves a Durable Object.
+			const isCanvas = isCurrentCanvasRoomRequest(url);
+			if (!isCurrentDocumentRoomRequest(url) && !isCanvas) return plain("Room not found", 404);
+			if (request.method !== "GET") return methodNotAllowed("GET");
+			if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return plain("WebSocket upgrade required", 426, { Upgrade: "websocket" });
+			if (!sameOrigin(request, env.APP_ENVIRONMENT)) return plain("Forbidden", 403);
+			const clientKey = await anonymousClientKey(request);
 			const room = isCurrentCanvasRoomRequest(url)
 				? await getServerByName<Env, CanvasRoom>(env.CANVAS_ROOM, todayCanvasRoomName())
 				: await getServerByName<Env, DocumentRoom>(env.DOCUMENT_ROOM, todayRoomName());
-			if (!await room.allowClientAction("websocket")) return new Response("Too many connections", { status: 429 });
-			const partyResponse = await routePartykitRequest(request, env, { onBeforeConnect: (connectionRequest) => sameOrigin(connectionRequest) ? undefined : new Response("Forbidden", { status: 403 }) });
-			if (partyResponse) return partyResponse;
+			if (!await room.allowWebSocketConnection(clientKey)) return plain("Too many connections", 429, { "Retry-After": "60" });
+			const headers = new Headers(request.headers);
+			headers.set("X-WebMCP-Client-Key", clientKey);
+			const routedRequest = new Request(request, { headers });
+			const partyResponse = await routePartykitRequest(routedRequest, env, { onBeforeConnect: (connectionRequest) => sameOrigin(connectionRequest, env.APP_ENVIRONMENT) ? undefined : plain("Forbidden", 403) });
+			return partyResponse ? secureResponse(partyResponse) : plain("Room not found", 404);
 		}
-		if (!url.pathname.startsWith("/api/")) return new Response("Not found", { status: 404 });
+		if (!url.pathname.startsWith("/api/")) return secureResponse(await env.ASSETS.fetch(request));
 		if (url.pathname.startsWith("/api/canvas/")) {
+			const getRoute = url.pathname === "/api/canvas/status" || url.pathname === "/api/canvas/revisions";
+			const postRoute = url.pathname === "/api/canvas/read" || url.pathname === "/api/canvas/mutate" || url.pathname === "/api/canvas/human-commit";
+			if (!getRoute && !postRoute) return json({ status: "not_found" }, 404);
+			if (getRoute && request.method !== "GET") return methodNotAllowed("GET");
+			if (postRoute && request.method !== "POST") return methodNotAllowed("POST");
+			let body: Record<string, unknown> | null = null;
+			let mutation: CanvasMutation | null = null;
+			let scene: CanvasElement[] | null = null;
+			let expectedRevision: number | null = null;
+			if (postRoute) {
+				if (!sameOrigin(request, env.APP_ENVIRONMENT)) return json({ status: "forbidden" }, 403);
+				if (!isJsonRequest(request)) return json({ status: "unsupported_media_type" }, 415);
+				body = await jsonBody(request);
+				if (!body) return json({ status: "invalid_json" }, 400);
+				if (url.pathname === "/api/canvas/read" && !safeId(body.sessionId)) return json({ status: "invalid_session" }, 400);
+				if (url.pathname === "/api/canvas/mutate") {
+					mutation = canvasMutation(body.mutation);
+					if (!safeId(body.sessionId) || !safeId(body.operationId) || !mutation) return json({ status: "invalid_mutation" }, 400);
+				}
+				if (url.pathname === "/api/canvas/human-commit") {
+					scene = canvasScene(body.elements);
+					expectedRevision = asRevision(body.expectedRevision);
+					if (!scene || expectedRevision === null) return json({ status: "invalid_scene" }, 400);
+				}
+			}
+			const clientKey = await anonymousClientKey(request);
 			const canvas = await getServerByName<Env, CanvasRoom>(env.CANVAS_ROOM, todayCanvasRoomName());
-			if (request.method === "POST" && !sameOrigin(request)) return json({ status: "forbidden" }, 403);
-			if (!await canvas.allowClientAction("http")) return json({ status: "rate_limited" }, 429);
-			if (url.pathname === "/api/canvas/status" && request.method === "GET") return json(await canvas.status());
-			if (url.pathname === "/api/canvas/revisions" && request.method === "GET") return json(await canvas.listRevisions());
-			if (request.method !== "POST") return json({ status: "method_not_allowed" }, 405);
-			const body = await jsonBody(request);
-			if (!body) return json({ status: "invalid_json" }, 400);
-			if (url.pathname === "/api/canvas/read") return json(await canvas.readForSession(String(body.sessionId ?? "")));
-			if (url.pathname === "/api/canvas/mutate") {
-				const mutation = canvasMutation(body.mutation);
-				return mutation ? json(await canvas.mutateForSession(String(body.sessionId ?? ""), mutation, String(body.operationId ?? ""), "WebMCP agent")) : json({ status: "invalid_mutation" }, 400);
-			}
-			if (url.pathname === "/api/canvas/human-commit") {
-				const scene = canvasScene(body.elements);
-				const expectedRevision = asRevision(body.expectedRevision);
-				return scene && expectedRevision !== null ? json(await canvas.commitHumanScene(expectedRevision, scene)) : json({ status: "invalid_scene" }, 400);
-			}
-			return json({ status: "not_found" }, 404);
+			if (!await canvas.allowHttpAction(clientKey)) return secureResponse(new Response(JSON.stringify({ status: "rate_limited" }), { status: 429, headers: { "content-type": "application/json", "cache-control": "no-store", "retry-after": "60" } }));
+			if (url.pathname === "/api/canvas/status") return json(await canvas.status());
+			if (url.pathname === "/api/canvas/revisions") return json(await canvas.listRevisions());
+			if (url.pathname === "/api/canvas/read") return json(await canvas.readForSession(body!.sessionId as string));
+			if (url.pathname === "/api/canvas/mutate") return json(await canvas.mutateForSession(body!.sessionId as string, mutation!, body!.operationId as string, "WebMCP agent"));
+			return json(await canvas.commitHumanScene(expectedRevision!, scene!));
 		}
-		const room = await getServerByName<Env, DocumentRoom>(env.DOCUMENT_ROOM, todayRoomName());
-		if (request.method === "POST" && !sameOrigin(request)) return json({ status: "forbidden" }, 403);
-		if (!await room.allowClientAction("http")) return json({ status: "rate_limited" }, 429);
-		if (url.pathname === "/api/status" && request.method === "GET") return json(await room.status());
-		if (url.pathname === "/api/config" && request.method === "GET") return json({ turnstileSiteKey: env.TURNSTILE_SITE_KEY, turnstileAction: TURNSTILE_ACTION });
-		if (url.pathname === "/api/revisions" && request.method === "GET") return json(await room.listRevisions(asOptionalQuery(url.searchParams.get("query")), asRevision(url.searchParams.get("beforeRevision"))));
 		const revisionMatch = url.pathname.match(/^\/api\/revisions\/(\d+)$/);
-		if (revisionMatch && request.method === "GET") return json(await room.readRevision(Number(revisionMatch[1])));
-		if (request.method !== "POST") return json({ status: "method_not_allowed" }, 405);
-		const body = await jsonBody(request);
-		if (!body) return json({ status: "invalid_json" }, 400);
-		if (url.pathname === "/api/agent/read") return json(await room.readForSession(String(body.sessionId ?? "")));
-		if (url.pathname === "/api/agent/changes") return json(await room.changesSinceLastRead(String(body.sessionId ?? "")));
+		const getRoute = url.pathname === "/api/status" || url.pathname === "/api/config" || url.pathname === "/api/revisions" || revisionMatch !== null;
+		const postRoute = url.pathname === "/api/agent/read" || url.pathname === "/api/agent/changes" || url.pathname === "/api/agent/edit" || url.pathname === "/api/human/commit" || url.pathname === "/api/revisions/restore-intents" || url.pathname === "/api/revisions/restore-cancel" || url.pathname === "/api/revisions/restore-confirm";
+		if (!getRoute && !postRoute) return json({ status: "not_found" }, 404);
+		if (getRoute && request.method !== "GET") return methodNotAllowed("GET");
+		if (postRoute && request.method !== "POST") return methodNotAllowed("POST");
+		let body: Record<string, unknown> | null = null;
+		let replacements: Replacement[] | null = null;
+		if (postRoute) {
+			if (!sameOrigin(request, env.APP_ENVIRONMENT)) return json({ status: "forbidden" }, 403);
+			if (!isJsonRequest(request)) return json({ status: "unsupported_media_type" }, 415);
+			body = await jsonBody(request);
+			if (!body) return json({ status: "invalid_json" }, 400);
+			if ((url.pathname === "/api/agent/read" || url.pathname === "/api/agent/changes") && !safeId(body.sessionId)) return json({ status: "invalid_session" }, 400);
+			if (url.pathname === "/api/agent/edit") {
+				if (!safeId(body.sessionId) || !safeId(body.operationId) || !Array.isArray(body.replacements) || body.replacements.length === 0 || body.replacements.length > MAX_REPLACEMENTS) return json({ status: "invalid_replacements" }, 400);
+				const parsedReplacements = body.replacements.map(asReplacement);
+				if (!parsedReplacements.every((replacement): replacement is Replacement => replacement !== null)) return json({ status: "invalid_replacements" }, 400);
+				replacements = parsedReplacements;
+			}
+			if (url.pathname === "/api/human/commit" && (typeof body.baseText !== "string" || typeof body.nextText !== "string" || body.baseText.length > MAX_DOCUMENT_LENGTH || body.nextText.length > MAX_DOCUMENT_LENGTH)) return json({ status: "invalid_document" }, 400);
+			if (url.pathname === "/api/revisions/restore-intents" && asRevision(body.revision) === null) return json({ status: "invalid_revision" }, 400);
+			if ((url.pathname === "/api/revisions/restore-cancel" || url.pathname === "/api/revisions/restore-confirm") && !safeId(body.intentId)) return json({ status: "invalid_intent" }, 400);
+			if (url.pathname === "/api/revisions/restore-confirm" && (typeof body.turnstileToken !== "string" || body.turnstileToken.length === 0 || body.turnstileToken.length > 2_048)) return json({ status: "turnstile_failed" }, 400);
+		}
+		if (revisionMatch && asRevision(revisionMatch[1]) === null) return json({ status: "invalid_revision" }, 400);
+		const clientKey = await anonymousClientKey(request);
+		const room = await getServerByName<Env, DocumentRoom>(env.DOCUMENT_ROOM, todayRoomName());
+		if (!await room.allowHttpAction(clientKey)) return secureResponse(new Response(JSON.stringify({ status: "rate_limited" }), { status: 429, headers: { "content-type": "application/json", "cache-control": "no-store", "retry-after": "60" } }));
+		if (url.pathname === "/api/status") return json(await room.status());
+		if (url.pathname === "/api/config") return json({ turnstileSiteKey: env.TURNSTILE_SITE_KEY, turnstileAction: TURNSTILE_ACTION });
+		if (url.pathname === "/api/revisions") return json(await room.listRevisions(asOptionalQuery(url.searchParams.get("query")), asRevision(url.searchParams.get("beforeRevision"))));
+		if (revisionMatch) return json(await room.readRevision(Number(revisionMatch[1])));
+		if (url.pathname === "/api/agent/read") return json(await room.readForSession(body!.sessionId as string));
+		if (url.pathname === "/api/agent/changes") return json(await room.changesSinceLastRead(body!.sessionId as string));
 		if (url.pathname === "/api/agent/edit") {
-			const replacements = Array.isArray(body.replacements) ? body.replacements.map(asReplacement).filter((item): item is Replacement => item !== null) : [];
-			return json(await room.editForSession(String(body.sessionId ?? ""), replacements, String(body.operationId ?? ""), "WebMCP agent"));
+			return json(await room.editForSession(body!.sessionId as string, replacements as Replacement[], body!.operationId as string, "WebMCP agent"));
 		}
 		if (url.pathname === "/api/human/commit") {
-			return typeof body.baseText === "string" && typeof body.nextText === "string"
-				? json(await room.commitHumanDraft(body.baseText, body.nextText))
-				: json({ status: "invalid_document" }, 400);
+			return json(await room.commitHumanDraft(body!.baseText as string, body!.nextText as string));
 		}
 		if (url.pathname === "/api/revisions/restore-intents") {
-			const revision = asRevision(body.revision);
-			return revision === null ? json({ status: "invalid_revision" }, 400) : json(await room.createRestoreIntent(revision, "workspace participant"));
+			return json(await room.createRestoreIntent(asRevision(body!.revision)!, "workspace participant"));
 		}
 		if (url.pathname === "/api/revisions/restore-cancel") {
-			const intentId = safeId(body.intentId);
-			return intentId ? json(await room.cancelRestoreIntent(intentId)) : json({ status: "invalid_intent" }, 400);
+			return json(await room.cancelRestoreIntent(body!.intentId as string));
 		}
 		if (url.pathname === "/api/revisions/restore-confirm") {
-			const intentId = safeId(body.intentId);
-			if (!intentId) return json({ status: "invalid_intent" }, 400);
+			const intentId = body!.intentId as string;
 			const lookup = await room.getRestoreIntent(intentId) as unknown as RestoreIntentLookup;
 			if (lookup.status !== "ok") return json(lookup);
 			const intentStatus = lookup.intent.status;
 			if (intentStatus === "completed") return json(await room.confirmRestore(intentId));
 			if (intentStatus !== "pending") return json({ status: intentStatus });
-			const verified = await verifyRestoreToken(env, body.turnstileToken, request, intentId);
+			const verified = await verifyRestoreToken(env, body!.turnstileToken, request, intentId);
 			if (verified.status !== "ok") return json(verified);
 			return json(await room.confirmRestore(intentId));
 		}

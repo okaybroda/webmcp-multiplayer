@@ -43,5 +43,6 @@
 			"react-dom"
 		]
 	},
-	"exclude": ["excalidraw"]
+	"include": ["src/**/*.ts", "vite.config.ts", "worker-configuration.d.ts"],
+	"exclude": ["dist", "excalidraw", "node_modules"]
 }
