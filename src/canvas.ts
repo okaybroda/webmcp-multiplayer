@@ -30,6 +30,12 @@ function safeCanvasLink(value: unknown): string | null {
 }
 function safeCanvasElement(element: CanvasElement): CanvasElement {
 	const copy = JSON.parse(JSON.stringify(element)) as CanvasElement;
+	// Keep the renderer resilient while legacy room snapshots are being
+	// normalized by the Worker after a deployment.
+	if (!Array.isArray(copy.groupIds)) copy.groupIds = [];
+	if (!("frameId" in copy)) copy.frameId = null;
+	if (!("boundElements" in copy)) copy.boundElements = null;
+	if (!("index" in copy)) copy.index = null;
 	if ("link" in copy) copy.link = safeCanvasLink(copy.link);
 	return copy;
 }

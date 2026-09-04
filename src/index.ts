@@ -256,7 +256,33 @@ function canvasElement(value: unknown): CanvasElement | null {
 	if (value.type === "text" && !["text", "originalText", "fontSize", "fontFamily", "lineHeight"].every((key) => Object.hasOwn(value, key))) return null;
 	if ((value.type === "line" || value.type === "arrow") && !Object.hasOwn(value, "points")) return null;
 	try {
-		const copy = JSON.parse(JSON.stringify(value)) as CanvasElement;
+		// Excalidraw assumes these common fields exist when rendering. Accepting a
+		// sparse-but-valid object without normalizing it lets a direct API caller
+		// store an element that later crashes every connected canvas (for example,
+		// the renderer reads `groupIds.length` unconditionally).
+		const copy = {
+			strokeColor: "#1e1e1e",
+			backgroundColor: "transparent",
+			fillStyle: "solid",
+			strokeWidth: 2,
+			strokeStyle: "solid",
+			roundness: null,
+			roughness: 1,
+			opacity: 100,
+			angle: 0,
+			seed: 1,
+			version: 1,
+			versionNonce: 1,
+			index: null,
+			isDeleted: false,
+			groupIds: [],
+			frameId: null,
+			boundElements: null,
+			updated: Date.now(),
+			link: null,
+			locked: false,
+			...JSON.parse(JSON.stringify(value)) as CanvasElement,
+		} as CanvasElement;
 		return new TextEncoder().encode(JSON.stringify(copy)).byteLength <= MAX_CANVAS_ELEMENT_BYTES ? copy : null;
 	} catch { return null; }
 }
